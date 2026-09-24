@@ -11,6 +11,7 @@
     "dev": "vite",
     "build": "npm run typecheck && vite build",
     "build:artifact": "vite build --mode artifact",
+    "package:vercel": "npm run build && node scripts/package-vercel.mjs",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
     "test": "vitest run"

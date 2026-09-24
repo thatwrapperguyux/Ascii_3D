@@ -5,3 +5,4 @@ dist-artifact
 *.log
 .DS_Store
 .env*.local
+ascii-3d-studio-vercel.zip

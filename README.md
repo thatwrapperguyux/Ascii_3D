@@ -42,9 +42,24 @@ Settings are remembered in your browser. Uploaded files never leave your device.
 
 ## Deploy to Vercel
 
-The repository is ready to deploy as is. `vercel.json` sets the framework
-(Vite), the build command and the output directory, and no environment variables
-are needed.
+**Easiest: drop a zip (no Git, no command line)**
+
+1. Get `ascii-3d-studio-vercel.zip`: run `npm run package:vercel`, which builds
+   the site and writes the zip to the project folder.
+2. Open [vercel.com/drop](https://vercel.com/drop) and drag the zip onto the page.
+3. Choose your team, name the project, and click **Deploy**.
+
+The zip holds the finished site (with `index.html` at the top level) and a
+`vercel.json` without build settings, so Vercel publishes it as-is. To update the
+site later, make your changes, run `npm run package:vercel` again, and drop the
+new zip. The same zip also works with the CLI: unzip it and run `npx vercel --prod`
+inside the folder.
+
+**From GitHub**
+
+The repository is also ready to deploy straight from GitHub. `vercel.json` sets
+the framework (Vite), the build command and the output directory, and no
+environment variables are needed.
 
 **From the Vercel dashboard**
 
