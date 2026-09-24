@@ -1,0 +1,28 @@
+{
+  "name": "ascii-3d-studio",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Turn GLB/GLTF 3D models into live, animated ASCII art in the browser.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run typecheck && vite build",
+    "build:artifact": "vite build --mode artifact",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "three": "0.186.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "@types/three": "0.186.0",
+    "typescript": "7.0.2",
+    "vite": "8.3.1",
+    "vitest": "5.0.1"
+  }
+}
