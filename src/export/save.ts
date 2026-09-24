@@ -22,6 +22,8 @@ const MIME: Record<string, string> = {
   json: 'application/json',
   webm: 'video/webm',
   mp4: 'video/mp4',
+  html: 'text/html;charset=utf-8',
+  zip: 'application/zip',
 };
 
 export async function saveFile(filename: string, data: Blob | string): Promise<SaveOutcome> {

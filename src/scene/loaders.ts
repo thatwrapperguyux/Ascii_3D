@@ -16,6 +16,8 @@ export interface LoadedModel {
   object: Object3D;
   clips: AnimationClip[];
   name: string;
+  /** The file exactly as loaded, kept for single-file .glb models so an embed can carry it unchanged. */
+  glb?: ArrayBuffer;
 }
 
 export type ProgressCallback = (fraction: number | null) => void;
@@ -147,8 +149,10 @@ export class ModelLoader {
       const ext = extensionOf(main.name);
       const name = baseName(main.name);
       switch (ext) {
-        case 'glb':
-          return this.fromGltf(await this.parseGltf(this.gltfLoader(manager), await main.arrayBuffer(), ''), name);
+        case 'glb': {
+          const buffer = await main.arrayBuffer();
+          return this.fromGltf(await this.parseGltf(this.gltfLoader(manager), buffer, ''), name, buffer);
+        }
         case 'gltf':
           return this.fromGltf(await this.parseGltf(this.gltfLoader(manager), await main.text(), ''), name);
         case 'fbx':
@@ -179,7 +183,7 @@ export class ModelLoader {
 
     switch (ext) {
       case 'glb':
-        return this.fromGltf(await this.parseGltf(this.gltfLoader(manager), buffer, path), name);
+        return this.fromGltf(await this.parseGltf(this.gltfLoader(manager), buffer, path), name, buffer);
       case 'gltf':
         return this.fromGltf(await this.parseGltf(this.gltfLoader(manager), text(), path), name);
       case 'fbx':
@@ -191,10 +195,15 @@ export class ModelLoader {
     }
   }
 
-  private fromGltf(gltf: GLTF, name: string): LoadedModel {
+  /** Loads a .glb held in memory, such as the model carried inside a downloaded embed. */
+  async fromBuffer(buffer: ArrayBuffer, name: string): Promise<LoadedModel> {
+    return this.fromGltf(await this.parseGltf(this.gltfLoader(new LoadingManager()), buffer, ''), name, buffer);
+  }
+
+  private fromGltf(gltf: GLTF, name: string, glb?: ArrayBuffer): LoadedModel {
     const object = gltf.scene ?? gltf.scenes[0];
     if (!object) throw new ModelLoadError('The glTF file has no scene to show.');
-    return { object, clips: gltf.animations ?? [], name };
+    return { object, clips: gltf.animations ?? [], name, glb };
   }
 
   private async parseFbx(buffer: ArrayBuffer, path: string, manager: LoadingManager, name: string): Promise<LoadedModel> {

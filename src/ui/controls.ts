@@ -1,6 +1,8 @@
 import { SCHEMA, sanitizeValue, type SettingKey, type Settings } from '../state/schema';
 import type { SettingsStore } from '../state/store';
 import { h } from './dom';
+import { Fsel, type FselOption } from './fsel';
+import { openPicker } from './picker';
 
 type KeysOfKind<Kind extends string> = {
   [K in SettingKey]: (typeof SCHEMA)[K]['kind'] extends Kind ? K : never;
@@ -19,12 +21,11 @@ export interface Control {
   when?: (settings: Readonly<Settings>) => boolean;
 }
 
-interface CommonOptions {
-  hint?: string;
+interface Common {
   when?: (settings: Readonly<Settings>) => boolean;
 }
 
-export interface SliderOptions extends CommonOptions {
+export interface ScrubOptions extends Common {
   unit?: string;
   /** Display multiplier, e.g. 100 to show 0.35 as 35%. */
   scale?: number;
@@ -38,187 +39,179 @@ function decimals(step: number): number {
   return text.includes('.') ? text.split('.')[1].length : 0;
 }
 
-function labelFor(id: string, text: string, hint?: string, resettable = false): HTMLLabelElement {
-  const title = [hint, resettable ? 'Double-click to reset.' : ''].filter(Boolean).join(' ');
-  return h('label', { for: id, title: title || null }, text);
-}
-
-export function slider(store: SettingsStore, key: NumberKey, label: string, options: SliderOptions = {}): Control {
+/**
+ * A row you drag: the label on the left, the value on the right, the fill
+ * showing where it sits. Double-click the row, or click the value, to type an
+ * exact number (Enter or blur commits, Escape leaves it alone).
+ */
+export function scrub(store: SettingsStore, key: NumberKey, label: string, options: ScrubOptions = {}): Control {
   const spec = SCHEMA[key] as { min: number; max: number; step: number; default: number };
-  const id = `ctl-${key}`;
   const scale = options.scale ?? 1;
   const digits = options.digits ?? Math.max(0, decimals(spec.step) - Math.round(Math.log10(scale)));
   const unit = options.unit ?? '';
-
-  const range = h('input', { type: 'range', id, class: 'full', min: spec.min, max: spec.max, step: spec.step });
-  const value = h('input', {
-    type: 'text',
-    class: 'num',
-    id: `${id}-value`,
-    inputmode: 'decimal',
-    'aria-label': `${label} value`,
-    spellcheck: 'false',
-    autocomplete: 'off',
-  });
-  const labelEl = labelFor(id, label, options.hint, true);
-  const el = h('div', { class: 'field' }, labelEl, value, range);
-
   const format = (v: number) => `${(v * scale).toFixed(digits)}${unit}`;
+
+  const range = h('input', {
+    type: 'range',
+    id: `ctl-${key}`,
+    min: spec.min,
+    max: spec.max,
+    step: spec.step,
+    'aria-label': label,
+  });
+  const value = h('output', { class: 'scrub-val', for: `ctl-${key}` });
+  const el = h(
+    'div',
+    { class: 'scrub', title: 'Drag to change · double-click to type a number' },
+    h('span', { class: 'scrub-ticks' }),
+    h('span', { class: 'scrub-label' }, label),
+    value,
+    h('span', { class: 'scrub-grip' }),
+    range,
+  );
 
   const sync = (s: Readonly<Settings>) => {
     const v = s[key];
     if (range.valueAsNumber !== v) range.value = String(v);
-    range.style.setProperty('--fill', `${((v - spec.min) / (spec.max - spec.min)) * 100}%`);
-    if (document.activeElement !== value) value.value = format(v);
+    el.style.setProperty('--p', String(Math.max(0, Math.min(1, (v - spec.min) / (spec.max - spec.min)))));
+    const text = format(v);
+    if (value.textContent !== text) value.textContent = text;
+    range.setAttribute('aria-valuetext', text);
   };
-
   range.addEventListener('input', () => store.set(patch(key, range.valueAsNumber)));
-  value.addEventListener('change', () => {
-    const next = sanitizeValue(key, parseFloat(value.value) / scale);
-    if (next !== undefined) store.set(patch(key, next));
-    value.value = format(store.get(key));
-  });
-  value.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') value.blur();
-    if (e.key === 'Escape') {
-      value.value = format(store.get(key));
-      value.blur();
-    }
-  });
-  labelEl.addEventListener('dblclick', () => store.set(patch(key, spec.default)));
 
+  const type = () => {
+    if (el.classList.contains('typing')) return;
+    el.classList.add('typing');
+    const box = h('input', {
+      type: 'text',
+      class: 'scrub-type',
+      inputmode: 'decimal',
+      'aria-label': `${label}, type a number`,
+    });
+    box.value = (store.get(key) * scale).toFixed(digits);
+    el.append(box);
+    box.focus();
+    box.select();
+    let done = false;
+    const close = (commit: boolean) => {
+      if (done) return;
+      done = true;
+      if (commit) {
+        const n = parseFloat(box.value.replace(/[^0-9.\-]/g, ''));
+        const next = Number.isFinite(n) ? sanitizeValue(key, n / scale) : undefined;
+        if (next !== undefined) store.set(patch(key, next));
+      }
+      el.classList.remove('typing');
+      box.remove();
+    };
+    box.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        close(true);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        close(false);
+      }
+    });
+    box.addEventListener('blur', () => close(true));
+  };
+  el.addEventListener('dblclick', (e) => {
+    e.preventDefault();
+    type();
+  });
+  value.addEventListener(
+    'pointerdown',
+    (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      type();
+    },
+    true,
+  );
   return { el, sync, when: options.when };
 }
 
-export function toggle(store: SettingsStore, key: BoolKey, label: string, options: CommonOptions = {}): Control {
-  const id = `ctl-${key}`;
-  const control = h('button', { type: 'button', role: 'switch', class: 'switch', id, 'aria-checked': 'false' });
-  const el = h('div', { class: 'field' }, labelFor(id, label, options.hint), control);
-  control.addEventListener('click', () => store.set(patch(key, !store.get(key))));
+export function toggle(store: SettingsStore, key: BoolKey, label: string, common: Common = {}): Control {
+  const input = h('input', { type: 'checkbox', id: `ctl-${key}` });
+  const el = h('label', { class: 'chk' }, input, label);
+  input.addEventListener('change', () => store.set(patch(key, input.checked)));
   return {
     el,
-    when: options.when,
-    sync: (s) => control.setAttribute('aria-checked', String(s[key])),
+    when: common.when,
+    sync: (s) => {
+      if (input.checked !== s[key]) input.checked = s[key];
+    },
   };
 }
 
-export function select<K extends EnumKey>(
+/** A label on the left and a drawn dropdown on the right. */
+export function selectRow<K extends EnumKey>(
   store: SettingsStore,
   key: K,
   label: string,
-  options: [Settings[K], string][],
-  common: CommonOptions = {},
-): Control {
-  const id = `ctl-${key}`;
-  const control = h('select', { id, class: 'full' }, ...options.map(([value, text]) => h('option', { value }, text)));
-  const el = h('div', { class: 'field' }, labelFor(id, label, common.hint), control);
-  control.addEventListener('change', () => {
-    const next = sanitizeValue(key, control.value);
+  options: FselOption[],
+  common: Common & { stacked?: boolean } = {},
+): Control & { fsel: Fsel } {
+  const fsel = new Fsel(`ctl-${key}`, label, options);
+  fsel.onChange((v) => {
+    const next = sanitizeValue(key, v);
     if (next !== undefined) store.set(patch(key, next));
   });
+  const el = common.stacked
+    ? h('div', { class: 'field' }, h('label', { for: `ctl-${key}-btn` }, label), fsel.el)
+    : h('div', { class: 'row2' }, h('label', { for: `ctl-${key}-btn` }, label), fsel.el);
   return {
     el,
+    fsel,
     when: common.when,
     sync: (s) => {
-      if (control.value !== s[key]) control.value = s[key];
+      fsel.value = s[key];
     },
   };
 }
 
-export function segmented<K extends EnumKey>(
-  store: SettingsStore,
-  key: K,
-  label: string,
-  options: [Settings[K], string][],
-  common: CommonOptions & { grid?: boolean } = {},
-): Control {
-  const id = `ctl-${key}`;
-  const buttons = options.map(([value, text]) =>
-    h('button', { type: 'button', role: 'radio', 'data-value': value, 'aria-checked': 'false', tabindex: '-1' }, text),
+/** A swatch and its hex, opening the fill picker the way a drawing tool does. */
+export function colorRow(store: SettingsStore, key: ColorKey, label: string, common: Common = {}): Control {
+  const chip = h('i');
+  const hex = h('span');
+  const btn = h('button', { type: 'button', class: 'sw-btn', id: `ctl-${key}`, 'aria-label': `${label} colour` }, chip, hex);
+  btn.addEventListener('click', () =>
+    openPicker(btn, store.get(key), (v) => {
+      const next = sanitizeValue(key, v);
+      if (next !== undefined) store.set(patch(key, next));
+    }),
   );
-  const group = h(
-    'div',
-    { class: `segmented${common.grid ? ' grid3' : ''}`, role: 'radiogroup', id, 'aria-label': label },
-    ...buttons,
-  );
-  const el = h('div', { class: 'field' }, h('span', { class: 'label', title: common.hint ?? null }, label), group);
-
-  const choose = (index: number) => {
-    const next = sanitizeValue(key, options[index][0]);
-    if (next !== undefined) store.set(patch(key, next));
-    buttons[index].focus();
-  };
-  buttons.forEach((btn, i) => btn.addEventListener('click', () => choose(i)));
-  group.addEventListener('keydown', (e) => {
-    const current = buttons.findIndex((b) => b.getAttribute('aria-checked') === 'true');
-    const delta = e.key === 'ArrowRight' || e.key === 'ArrowDown' ? 1 : e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -1 : 0;
-    if (!delta) return;
-    e.preventDefault();
-    choose((current + delta + buttons.length) % buttons.length);
-  });
-
+  const el = h('div', { class: 'crow' }, h('span', {}, label), btn);
   return {
     el,
     when: common.when,
     sync: (s) => {
-      for (const btn of buttons) {
-        const on = btn.dataset.value === s[key];
-        btn.setAttribute('aria-checked', String(on));
-        btn.tabIndex = on ? 0 : -1;
-      }
+      chip.style.background = s[key];
+      if (hex.textContent !== s[key]) hex.textContent = s[key];
     },
   };
 }
 
-export function color(store: SettingsStore, key: ColorKey, label: string, common: CommonOptions = {}): Control {
-  const id = `ctl-${key}`;
-  const picker = h('input', { type: 'color', id, 'aria-label': label });
-  const hex = h('input', {
-    type: 'text',
-    class: 'num',
-    id: `${id}-hex`,
-    maxlength: 7,
-    spellcheck: 'false',
-    autocomplete: 'off',
-    'aria-label': `${label} hex value`,
-  });
-  const el = h('div', { class: 'field' }, labelFor(id, label, common.hint), h('div', { class: 'color-field' }, picker, hex));
-  picker.addEventListener('input', () => store.set(patch(key, picker.value)));
-  hex.addEventListener('change', () => {
-    const next = sanitizeValue(key, hex.value.startsWith('#') ? hex.value : `#${hex.value}`);
-    if (next !== undefined) store.set(patch(key, next));
-    hex.value = store.get(key);
-  });
-  return {
-    el,
-    when: common.when,
-    sync: (s) => {
-      if (picker.value !== s[key]) picker.value = s[key];
-      if (document.activeElement !== hex) hex.value = s[key];
-    },
-  };
-}
-
-export function text(
+export function textField(
   store: SettingsStore,
   key: TextKey,
   label: string,
-  common: CommonOptions & { placeholder?: string } = {},
+  common: Common & { placeholder?: string } = {},
 ): Control {
-  const id = `ctl-${key}`;
   const input = h('input', {
     type: 'text',
-    id,
-    class: 'text-input mono full',
+    id: `ctl-${key}`,
+    class: 'txt-in mono',
     placeholder: common.placeholder ?? null,
     spellcheck: 'false',
     autocomplete: 'off',
   });
-  const el = h('div', { class: 'field' }, labelFor(id, label, common.hint), input);
   input.addEventListener('input', () => {
     const next = sanitizeValue(key, input.value);
     if (next !== undefined) store.set(patch(key, next));
   });
+  const el = h('div', { class: 'field' }, h('label', { for: `ctl-${key}` }, label), input);
   return {
     el,
     when: common.when,
@@ -228,7 +221,16 @@ export function text(
   };
 }
 
-/** A control that renders arbitrary content and re-renders on every settings change. */
-export function custom(el: HTMLElement, sync: (s: Readonly<Settings>) => void, when?: Control['when']): Control {
+/** "What this does": the explanation stays one click away instead of eating the panel. */
+export function tip(...paragraphs: string[]): HTMLElement {
+  return h('details', { class: 'tip' }, h('summary', {}, 'What this does'), ...paragraphs.map((p) => h('p', {}, p)));
+}
+
+export function grp(label: string): HTMLElement {
+  return h('div', { class: 'grp' }, label);
+}
+
+/** Wraps arbitrary content that re-renders on every settings change. */
+export function custom(el: HTMLElement, sync: (s: Readonly<Settings>) => void = () => {}, when?: Control['when']): Control {
   return { el, sync, when };
 }

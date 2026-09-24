@@ -37,6 +37,14 @@ export interface ModelInfo {
   clips: string[];
 }
 
+/** A rectangle in CSS pixels, relative to the canvas. */
+export interface FrameRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface PointerState {
   /** -1 (left) … 1 (right) */
   x: number;
@@ -203,9 +211,14 @@ export class Stage {
     if (this.model) this.shadingLibrary.apply(this.model, shading);
   }
 
-  setAspect(aspect: number): void {
-    this.camera.aspect = aspect;
-    this.camera.updateProjectionMatrix();
+  /**
+   * Aims the camera at `frame`, a rectangle inside the canvas (in CSS pixels):
+   * the model is centred and fitted there, and the rest of the canvas simply
+   * continues the same view, under the panels.
+   */
+  setFrame(canvasWidth: number, canvasHeight: number, frame: FrameRect): void {
+    this.camera.aspect = frame.w / frame.h;
+    this.camera.setViewOffset(frame.w, frame.h, -frame.x, -frame.y, canvasWidth, canvasHeight);
   }
 
   /** Changes the field of view while keeping the model the same apparent size (a dolly zoom). */

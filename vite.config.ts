@@ -69,9 +69,10 @@ function artifactFragment(): Plugin {
       html = [
         title,
         ...fontLinks,
-        `<style>${styles.join('\n')}</style>`,
+        // Tagged so the app can read its own code back out when it packs an embed.
+        `<style id="ascii3d-css">${styles.join('\n')}</style>`,
         cleanBody.trim(),
-        ...scripts.map((code) => `<script type="module">${code}</script>`),
+        ...scripts.map((code, i) => `<script type="module"${i === 0 ? ' id="ascii3d-js"' : ''}>${code}</script>`),
       ].join('\n');
 
       htmlAsset.source = html;

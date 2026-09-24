@@ -103,17 +103,19 @@ export const SCHEMA = {
   edges: bool(false),
   edgeThreshold: num(0.55, 0.05, 2, 0.01),
 
-  // Color
-  colorMode: oneOf(keysOf(COLOR_MODES), 'gradient'),
-  fg: color('#f2e6d0'),
+  // Color. With matchTheme on, glyphs, ground and accent follow the interface
+  // theme (ink on white in light mode, white on near-black in dark mode).
+  matchTheme: bool(true),
+  colorMode: oneOf(keysOf(COLOR_MODES), 'mono'),
+  fg: color('#18181b'),
   gradA: color('#4a3b2a'),
   gradB: color('#d9a866'),
   gradC: color('#fff4de'),
   colorBoost: num(0.5, 0, 1, 0.01),
   saturation: num(1, 0, 2, 0.01),
-  bg: color('#0b0c0e'),
+  bg: color('#ffffff'),
   transparentBg: bool(false),
-  accent: color('#8edcf0'),
+  accent: color('#71717a'),
 
   // Model
   shading: oneOf(keysOf(SHADINGS), 'clay'),
@@ -144,14 +146,14 @@ export const SCHEMA = {
   scanGlitch: num(0.6, 0, 1, 0.01),
   lens: bool(true),
   lensRadius: num(90, 20, 400, 1),
-  noise: num(0.04, 0, 1, 0.01),
-  glow: num(0.22, 0, 1.5, 0.01),
+  noise: num(0.03, 0, 1, 0.01),
+  glow: num(0, 0, 1.5, 0.01),
   glowRadius: num(0.45, 0, 1, 0.01),
   glowThreshold: num(0.4, 0, 1, 0.01),
-  field: num(0.035, 0, 1, 0.01),
+  field: num(0, 0, 1, 0.01),
   grid: num(0, 0, 1, 0.01),
   crt: num(0, 0, 1, 0.01),
-  vignette: num(0.35, 0, 1, 0.01),
+  vignette: num(0, 0, 1, 0.01),
   reveal: bool(true),
 } as const;
 

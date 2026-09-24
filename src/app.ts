@@ -6,12 +6,24 @@ import { FOX_URL } from 'virtual:sample-models';
 import { AsciiPass } from './ascii/AsciiPass';
 import { GLITCH_CHARS, ensureFontLoaded, fontStack, measureGlyphMetrics } from './ascii/glyphAtlas';
 import { asciiToText, cellsToAscii, type AsciiCell } from './ascii/mapping';
+import {
+  base64ToBytes,
+  buildEmbedPage,
+  bytesToBase64,
+  collectAppCode,
+  glbIsPortable,
+  iframeCode,
+  type EmbedConfig,
+  type EmbedModel,
+} from './export/embed';
 import { CanvasRecorder, pickVideoFormat } from './export/recorder';
-import { copyText, prepareSaving, saveFile, slug, timestamp } from './export/save';
+import { copyText, prepareSaving, saveFile, slug } from './export/save';
 import { buildSvg, glyphColorFn } from './export/svg';
+import { buildZip, type ZipEntry } from './export/zip';
 import { ACCEPTED_FILES, ModelLoader, type LoadedModel } from './scene/loaders';
 import { createProceduralSample, isSampleId, type SampleId } from './scene/samples';
-import { Stage, type ModelSource, type PointerState } from './scene/stage';
+import { Stage, type FrameRect, type ModelSource, type PointerState } from './scene/stage';
+import { THEME_GROUND, effectiveSettings, relativeLuminance, type UiTheme } from './state/look';
 import { PRESETS, presetSettings, randomLook } from './state/presets';
 import {
   FONTS,
@@ -22,47 +34,62 @@ import {
   type SettingKey,
   type Settings,
 } from './state/schema';
-import { encodeSettings, storeSettings } from './state/share';
+import { encodeSettings, storeSettings, writePref } from './state/share';
 import { SettingsStore } from './state/store';
-import { formatCount } from './ui/dom';
-import { Panel } from './ui/panel';
+import { spinTorus } from './ui/donut';
+import { formatCount, paintIcons, svg } from './ui/dom';
+import { LOGO_MARK } from './ui/icons';
+import { Panel, type PanelActions } from './ui/panel';
+import { wireSound } from './ui/sound';
 import { Toaster } from './ui/toast';
+import { Tour } from './ui/tour';
 
 export interface AppDom {
   app: HTMLElement;
   stage: HTMLElement;
   viewport: HTMLElement;
-  frame: HTMLElement;
   canvas: HTMLCanvasElement;
-  inspector: HTMLElement;
-  modelName: HTMLElement;
+  railLeft: HTMLElement;
+  railRight: HTMLElement;
+  stagebar: HTMLElement;
+  framemarks: HTMLElement;
   telemetry: HTMLElement;
-  hint: HTMLElement;
-  dropzone: HTMLElement;
+  themeSwitch: HTMLElement;
+  hideButton: HTMLButtonElement;
+  fullscreenButton: HTMLButtonElement;
+  soundButton: HTMLButtonElement;
+  cta: HTMLElement;
+  randomButton: HTMLButtonElement;
+  recordButton: HTMLButtonElement;
+  recordTitle: HTMLElement;
+  recordSub: HTMLElement;
   loading: HTMLElement;
   loadingLabel: HTMLElement;
   loadingBar: HTMLElement;
-  toasts: HTMLElement;
+  dropzone: HTMLElement;
+  toast: HTMLElement;
   fileInput: HTMLInputElement;
-  uploadButton: HTMLButtonElement;
-  snapshotButton: HTMLButtonElement;
-  recordButton: HTMLButtonElement;
-  recordTime: HTMLElement;
-  fullscreenButton: HTMLButtonElement;
-  hideButton: HTMLButtonElement;
-  panelButton: HTMLButtonElement;
+  mob: HTMLElement;
+  mobSheet: HTMLElement;
+  mobCopy: HTMLButtonElement;
+  mobOpen: HTMLButtonElement;
 }
 
 export interface AppOptions {
-  /** Chrome-less mode for iframes: no inspector, overlays, storage or drag and drop. */
+  /** Chrome-less mode for iframes: the render alone, no panels, storage or drag and drop. */
   embed: boolean;
   /** Orbit controls on/off (embeds can turn them off for background use). */
   orbit: boolean;
   /** Persist settings to localStorage. */
   persist: boolean;
-  /** Offer "load from URL" and share links (not possible inside the Artifact sandbox). */
+  /** Load by URL and share links that point back at this site (not possible inside the Artifact sandbox). */
   networkFeatures: boolean;
+  /** The page's markup as it was before the app filled it in; embed downloads are built from it. */
+  shell: string;
 }
+
+/** The first model: a `?model=` value (a URL or `sample:id`), or the one an embed page carries. */
+export type StartModel = string | EmbedModel | null;
 
 interface LoadTask {
   loaded: LoadedModel;
@@ -72,6 +99,10 @@ interface LoadTask {
 
 const LOOK_KEYS_CHANGING_ATLAS: SettingKey[] = ['charset', 'customChars', 'font', 'bold', 'glyphScale'];
 const REVEAL_SECONDS = 1.2;
+/** A frame smaller than this between the panels isn't worth framing into; the whole stage is used instead. */
+const MIN_FRAME = { w: 220, h: 160 };
+/** Past this, a ground counts as light (dark ink reads better on it than white does). */
+const LIGHT_GROUND = 0.179;
 
 export class App {
   readonly store: SettingsStore;
@@ -82,14 +113,21 @@ export class App {
   private readonly stage: Stage;
   private readonly loader: ModelLoader;
   private readonly toaster: Toaster;
+  private readonly tour = new Tour();
   private readonly timer = new Timer();
   private readonly pointer: PointerState = { x: 0, y: 0, active: false };
   private readonly lens = { x: -1e4, y: -1e4, inside: false, cellX: -1, cellY: -1 };
   private panel: Panel | null = null;
+  private theme: UiTheme;
+  private current: LoadedModel | null = null;
+  private startClip = -1;
 
   private pixelRatio = 1;
   private cssWidth = 1;
   private cssHeight = 1;
+  /** The part of the canvas that exports capture and the model is framed in (CSS px). */
+  private frameRect: FrameRect = { x: 0, y: 0, w: 1, h: 1 };
+  private layoutQueued = 0;
   private elapsed = 0;
   private scanPhase = 0;
   private revealStart = -1;
@@ -98,6 +136,8 @@ export class App {
   private loadingTimer = 0;
   private atlasToken = 0;
   private recorder: CanvasRecorder | null = null;
+  private recordTarget: { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D } | null = null;
+  private embedBusy = false;
   private persistTimer = 0;
   private frames = 0;
   private fps = 0;
@@ -114,7 +154,8 @@ export class App {
     private readonly options: AppOptions,
   ) {
     this.store = new SettingsStore(initial);
-    this.toaster = new Toaster(dom.toasts);
+    this.toaster = new Toaster(dom.toast);
+    this.theme = document.documentElement.dataset.ui === 'dark' ? 'dark' : 'light';
 
     this.renderer = new WebGLRenderer({
       canvas: dom.canvas,
@@ -139,31 +180,34 @@ export class App {
     prepareSaving();
   }
 
-  /** Builds the UI, starts rendering and loads the first model. */
-  async start(initialModel: string | null): Promise<void> {
+  /** Builds the interface, starts rendering and loads the first model. */
+  async start(model: StartModel, clip = -1): Promise<void> {
     const { dom, options } = this;
     dom.app.classList.toggle('embed', options.embed);
     dom.fileInput.accept = ACCEPTED_FILES;
+    this.startClip = clip;
 
     if (!options.embed) {
-      this.panel = new Panel(dom.inspector, this.store, this.panelActions(), {
-        urlLoading: options.networkFeatures,
-        sharing: options.networkFeatures,
-      });
-      this.bindStageButtons();
+      paintIcons(document);
+      this.panel = new Panel(dom.railLeft, dom.railRight, this.store, this.panelActions(), { network: options.networkFeatures }, this.theme);
+      this.bindChrome();
+      this.bindThemeSwitch();
       this.bindDragAndDrop();
       this.bindKeyboard();
+      this.bindPhone();
+      wireSound(dom.soundButton);
     }
     this.bindPointer();
 
     this.stage.shadingLibrary.updateMaterials(this.store.value);
     this.stage.setFov(this.store.value.fov);
-    this.applyLook(this.store.value);
+    this.applyLook();
     this.store.subscribe((changed, s) => this.onSettingsChange(changed, s));
 
-    new ResizeObserver(() => this.resize()).observe(dom.viewport);
-    matchMedia('(prefers-reduced-motion: reduce)').matches && this.setMotionPaused(true);
-    this.resize();
+    const observer = new ResizeObserver(() => this.scheduleLayout());
+    for (const el of [dom.stage, dom.cta, dom.stagebar, dom.railLeft, dom.railRight]) observer.observe(el);
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) this.setMotionPaused(true);
+    this.layout();
 
     dom.canvas.addEventListener('webglcontextlost', (event) => {
       event.preventDefault();
@@ -171,66 +215,163 @@ export class App {
     });
 
     this.renderer.setAnimationLoop((time) => this.frame(time));
-    await this.loadInitialModel(initialModel);
+    await this.loadInitialModel(model);
+    if (!options.embed) this.tour.maybeStart();
   }
 
-  // ─── Settings ────────────────────────────────────────────
+  // ─── Theme & look ────────────────────────────────────────
+
+  /** The settings as rendered: with "Match the interface theme" on, the theme supplies ground and ink. */
+  private look(): Settings {
+    return effectiveSettings(this.store.value, this.theme);
+  }
+
+  private setTheme(theme: UiTheme): void {
+    if (theme === this.theme) return;
+    this.theme = theme;
+    document.documentElement.dataset.ui = theme;
+    writePref('ui', theme);
+    this.syncThemeSwitch();
+    this.panel?.setTheme(theme);
+    this.applyLook();
+  }
+
+  private syncThemeSwitch(): void {
+    this.dom.themeSwitch.querySelectorAll<HTMLButtonElement>('button[data-v]').forEach((b) => {
+      b.setAttribute('aria-pressed', String(b.dataset.v === this.theme));
+    });
+  }
 
   private onSettingsChange(changed: ReadonlySet<SettingKey>, s: Readonly<Settings>): void {
-    this.applyLook(s);
+    this.applyLook();
     const cellChanged = (changed.has('cellSize') || changed.has('charAspect')) && this.updateCellSize();
     if (!cellChanged && LOOK_KEYS_CHANGING_ATLAS.some((key) => changed.has(key))) this.refreshAtlas();
     if (changed.has('shading')) this.stage.setShading(s.shading);
     if (changed.has('baseColor') || changed.has('flatShading')) this.stage.shadingLibrary.updateMaterials(s);
     if (changed.has('fov')) this.stage.setFov(s.fov);
-    if (changed.has('frame')) this.resize();
+    if (changed.has('frame')) this.layout();
     if (this.options.persist) {
       window.clearTimeout(this.persistTimer);
       this.persistTimer = window.setTimeout(() => storeSettings(this.store.value), 300);
     }
   }
 
-  private applyLook(s: Readonly<Settings>): void {
-    this.asciiPass.applySettings(s);
-    this.bloomPass.enabled = s.glow > 0.001;
-    this.bloomPass.strength = s.glow;
-    this.bloomPass.radius = s.glowRadius;
-    this.bloomPass.threshold = s.glowThreshold;
-    this.dom.frame.classList.toggle('transparent', s.transparentBg);
-    const fill = s.frame === 'fill' && !s.transparentBg;
-    this.dom.stage.style.background = fill ? s.bg : '';
-    // Overlay text switches to dark ink when it sits on a light background.
-    this.dom.stage.classList.toggle('light', fill && relativeLuminance(s.bg) > 0.45);
+  private applyLook(): void {
+    const look = this.look();
+    this.asciiPass.applySettings(look);
+    this.bloomPass.enabled = look.glow > 0.001;
+    this.bloomPass.strength = look.glow;
+    this.bloomPass.radius = look.glowRadius;
+    this.bloomPass.threshold = look.glowThreshold;
+
+    const { stage, app } = this.dom;
+    const house = THEME_GROUND[this.theme].bg;
+    const transparent = look.transparentBg;
+    const ground = transparent ? house : look.bg;
+    const root = document.documentElement.style;
+    root.setProperty('--ground', transparent && this.options.embed ? 'transparent' : ground);
+    stage.classList.toggle('transparent', transparent);
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', ground);
+
+    // A ground unlike the interface's own gets floating controls with their own
+    // surface, and panels that wash up opaque enough to read over it.
+    const own = ground.toLowerCase() !== house;
+    const light = relativeLuminance(ground) > LIGHT_GROUND;
+    stage.classList.toggle('onart', own);
+    stage.classList.toggle('onlight', own && light);
+    app.classList.toggle('washup', own && light === (this.theme === 'dark'));
+    // Outside a fixed frame, the render fades toward its own ground.
+    stage.style.setProperty('--frame-dim', `${ground}9e`);
   }
 
   // ─── Layout ──────────────────────────────────────────────
 
-  private resize(): void {
-    const { viewport } = this.dom;
-    const s = this.store.value;
-    const framed = s.frame !== 'fill';
-    viewport.classList.toggle('framed', framed);
-    const style = getComputedStyle(viewport);
-    let width = viewport.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
-    let height = viewport.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
-    if (framed) {
-      const [a, b] = s.frame.split(':').map(Number);
-      const ratio = a / b;
-      if (width / height > ratio) width = height * ratio;
-      else height = width / ratio;
-    }
-    this.cssWidth = Math.max(1, Math.floor(width));
-    this.cssHeight = Math.max(1, Math.floor(height));
-    this.pixelRatio = Math.min(window.devicePixelRatio || 1, this.maxPixelRatio);
-    this.applySize(this.pixelRatio);
+  private scheduleLayout(): void {
+    if (this.layoutQueued) return;
+    this.layoutQueued = requestAnimationFrame(() => {
+      this.layoutQueued = 0;
+      this.layout();
+    });
   }
 
-  private applySize(ratio: number): void {
+  private chromeVisible(): boolean {
+    return !this.options.embed && !this.dom.app.classList.contains('ui-hidden');
+  }
+
+  /** The clear ground between the panels, under the top bar and above the buttons (stage CSS px). */
+  private freeArea(width: number, height: number): FrameRect {
+    const whole = { x: 0, y: 0, w: width, h: height };
+    if (!this.chromeVisible()) return whole;
+    const { dom } = this;
+    const origin = dom.stage.getBoundingClientRect();
+    let left = 0;
+    let right = width;
+    let top = 0;
+    let bottom = height;
+    // The rails float over the stage only on wide screens; below that they sit beside or under it.
+    if (getComputedStyle(dom.railLeft).position === 'absolute') {
+      const l = dom.railLeft.getBoundingClientRect();
+      const r = dom.railRight.getBoundingClientRect();
+      if (l.width) left = Math.max(left, l.right - origin.left);
+      if (r.width) right = Math.min(right, r.left - origin.left);
+    }
+    const bar = dom.stagebar.getBoundingClientRect();
+    if (bar.height) top = Math.max(top, bar.bottom - origin.top);
+    const cta = dom.cta.getBoundingClientRect();
+    if (cta.height) bottom = Math.min(bottom, cta.top - origin.top - 8);
+    const area = { x: Math.round(left), y: Math.round(top), w: Math.round(right - left), h: Math.round(bottom - top) };
+    return area.w >= MIN_FRAME.w && area.h >= MIN_FRAME.h ? area : whole;
+  }
+
+  /** The export frame: the free area itself, or the largest rectangle of the chosen shape inside it. */
+  private fitFrame(free: FrameRect): FrameRect {
+    const frame = this.store.value.frame;
+    if (frame === 'fill') return free;
+    const [a, b] = frame.split(':').map(Number);
+    const ratio = a / b;
+    const inset = this.chromeVisible() ? 16 : 0;
+    let w = Math.max(1, free.w - inset * 2);
+    let h = Math.max(1, free.h - inset * 2);
+    if (w / h > ratio) w = h * ratio;
+    else h = w / ratio;
+    w = Math.floor(w);
+    h = Math.floor(h);
+    return { x: Math.round(free.x + (free.w - w) / 2), y: Math.round(free.y + (free.h - h) / 2), w, h };
+  }
+
+  private layout(): void {
+    const { stage } = this.dom;
+    this.cssWidth = Math.max(1, Math.floor(stage.clientWidth));
+    this.cssHeight = Math.max(1, Math.floor(stage.clientHeight));
+    const free = this.freeArea(this.cssWidth, this.cssHeight);
+    this.frameRect = this.fitFrame(free);
+    this.pixelRatio = Math.min(window.devicePixelRatio || 1, this.maxPixelRatio);
+    this.applySize(this.cssWidth, this.cssHeight, this.frameRect, this.pixelRatio);
+
+    // Overlays centre on the free area rather than the window.
+    const origin = stage.getBoundingClientRect();
+    const root = document.documentElement.style;
+    root.setProperty('--free-cx', `${free.x + free.w / 2}px`);
+    root.setProperty('--free-vx', `${origin.left + free.x + free.w / 2}px`);
+
+    const marks = this.dom.framemarks;
+    const fixed = this.store.value.frame !== 'fill' && !this.options.embed;
+    marks.hidden = !fixed;
+    if (fixed) {
+      const f = this.frameRect;
+      marks.style.left = `${f.x}px`;
+      marks.style.top = `${f.y}px`;
+      marks.style.width = `${f.w}px`;
+      marks.style.height = `${f.h}px`;
+    }
+  }
+
+  private applySize(width: number, height: number, frame: FrameRect, ratio: number): void {
     this.renderer.setPixelRatio(ratio);
-    this.renderer.setSize(this.cssWidth, this.cssHeight);
+    this.renderer.setSize(width, height, false);
     this.composer.setPixelRatio(ratio);
-    this.composer.setSize(this.cssWidth, this.cssHeight);
-    this.stage.setAspect(this.cssWidth / this.cssHeight);
+    this.composer.setSize(width, height);
+    this.stage.setFrame(width, height, frame);
     this.updateCellSize(ratio);
   }
 
@@ -244,7 +385,7 @@ export class App {
     const width = Math.max(2, Math.round(height * s.charAspect));
     const changed = width !== this.asciiPass.cellWidth || height !== this.asciiPass.cellHeight;
     this.asciiPass.setCellSize(width, height);
-    this.asciiPass.applySettings(s);
+    this.asciiPass.applySettings(this.look());
     if (!changed && this.asciiPass.atlas.layout.rampCount > 0) return false;
     this.refreshAtlas();
     return true;
@@ -289,6 +430,7 @@ export class App {
     const dt = Math.min(this.timer.getDelta(), 0.1);
     this.tick(dt);
     this.composer.render(dt);
+    if (this.recordTarget) this.copyFrameTo(this.recordTarget.ctx, this.recordTarget.canvas);
     this.telemetry(time);
   }
 
@@ -332,21 +474,23 @@ export class App {
     if (this.options.embed || time - this.lastTelemetry < 250) return;
     this.lastTelemetry = time;
 
+    const f = this.frameRect;
+    const cols = Math.round((f.w * this.pixelRatio) / this.asciiPass.cellWidth);
+    const rows = Math.round((f.h * this.pixelRatio) / this.asciiPass.cellHeight);
     const info = this.stage.info;
     const clip = this.stage.clipProgress();
-    const item = (label: string, value: string, cls = '') => `<span class="${cls}">${label} <b>${value}</b></span>`;
+    const item = (label: string, value: string) => `${label} <b>${value}</b>`;
     const parts = [
-      `<span class="live${this.stage.motionPaused ? ' paused' : ''}">${this.recorder ? 'REC' : this.stage.motionPaused ? 'PAUSED' : 'LIVE'}</span>`,
-      item('Cells', `${this.asciiPass.cols}×${this.asciiPass.rows}`),
-      item('Glyphs', String(this.asciiPass.atlas.layout.rampCount)),
+      this.recorder ? '<b>● Rec</b>' : this.stage.motionPaused ? 'Paused' : 'Live',
+      item('Cells', `${cols}×${rows}`),
       item('FPS', String(this.fps)),
     ];
     if (info) parts.push(item('Tris', formatCount(info.triangles)));
-    if (clip) parts.push(item(escapeHtml(clip.name), `${clip.time.toFixed(2)}/${clip.duration.toFixed(2)}s`));
-    if (this.lens.inside && this.lens.cellX >= 0) {
-      parts.push(item('Cursor', `${pad3(this.lens.cellX)}·${pad3(this.lens.cellY)}`));
-    }
-    this.dom.telemetry.innerHTML = parts.join('');
+    if (clip) parts.push(item(escapeHtml(clip.name), `${clip.time.toFixed(1)}/${clip.duration.toFixed(1)}<i>s</i>`));
+    if (this.lens.inside && this.lens.cellX >= 0) parts.push(item('Cursor', `${pad3(this.lens.cellX)}·${pad3(this.lens.cellY)}`));
+    const html = parts.join(' · ');
+    if (this.dom.telemetry.innerHTML !== html) this.dom.telemetry.innerHTML = html;
+    if (!this.recorder) this.syncRecordButton();
   }
 
   /**
@@ -362,13 +506,18 @@ export class App {
     if (this.slowSamples >= 6) {
       this.slowSamples = 0;
       this.maxPixelRatio = Math.max(1, this.pixelRatio - 0.5);
-      this.resize();
+      this.layout();
     }
   }
 
   // ─── Models ──────────────────────────────────────────────
 
-  private async loadInitialModel(model: string | null): Promise<void> {
+  private async loadInitialModel(model: StartModel): Promise<void> {
+    if (model && typeof model === 'object') {
+      const ok = await this.loadEmbedModel(model);
+      if (!ok) this.dom.loading.hidden = true;
+      return;
+    }
     if (model && model.startsWith('sample:') && isSampleId(model.slice(7))) {
       await this.loadSample(model.slice(7) as SampleId);
     } else if (model && this.options.networkFeatures) {
@@ -377,6 +526,31 @@ export class App {
     } else {
       await this.loadSample('fox');
     }
+  }
+
+  /** The model inside an embed page: a sample, a file beside the page, or bytes in the page itself. */
+  private loadEmbedModel(model: EmbedModel): Promise<boolean> {
+    if (model.kind === 'sample') return this.loadSample(isSampleId(model.id) ? model.id : 'fox');
+    if (model.kind === 'url') {
+      if (location.protocol === 'file:') {
+        // Browsers don't let a page opened from disk read the file next to it.
+        this.toast(
+          'This embed loads model.glb from its web host, so it has to be online to show. Upload the folder (e.g. to vercel.com/drop), or use the single .html download to open it from your computer.',
+          'error',
+          60_000,
+        );
+        return Promise.resolve(false);
+      }
+      const url = new URL(model.url, location.href).href;
+      return this.loadModel(model.name, async () => ({
+        loaded: await this.loader.fromUrl(url, (p) => this.showProgress(p), model.name),
+        source: { kind: 'url', url },
+      }));
+    }
+    return this.loadModel(model.name, async () => ({
+      loaded: await this.loader.fromBuffer(base64ToBytes(model.base64).buffer, model.name),
+      source: { kind: 'file' },
+    }));
   }
 
   async loadSample(id: SampleId): Promise<boolean> {
@@ -444,11 +618,14 @@ export class App {
         return false;
       }
       const s = this.store.value;
-      const info = this.stage.setModel(result.loaded.object, result.loaded.clips, result.loaded.name, result.source, result.update);
+      const { loaded } = result;
+      const info = this.stage.setModel(loaded.object, loaded.clips, loaded.name, result.source, result.update);
+      this.current = loaded;
       this.stage.setShading(s.shading);
       this.stage.shadingLibrary.updateMaterials(s);
-      this.dom.modelName.textContent = `${info.name} — ${formatCount(info.triangles)} tris${info.clips.length ? ` · ${info.clips.length} clips` : ''}`;
-      this.panel?.setModel(info, this.stage.activeClip);
+      if (this.startClip >= 0 && this.startClip < info.clips.length) this.stage.playClip(this.startClip, 0);
+      this.startClip = -1;
+      this.panel?.setModel(info, this.stage.activeClip, result.source.kind !== 'file' && this.options.networkFeatures);
       if (s.reveal) {
         this.revealStart = this.elapsed;
         this.asciiPass.uniforms.uReveal.value = 0;
@@ -480,60 +657,87 @@ export class App {
 
   private toggleUi(): void {
     const hidden = this.dom.app.classList.toggle('ui-hidden');
-    this.dom.hideButton.setAttribute('aria-label', hidden ? 'Show interface' : 'Hide interface');
-    this.dom.hideButton.title = hidden ? 'Show interface (H)' : 'Hide interface (H)';
+    this.dom.hideButton.setAttribute('aria-label', hidden ? 'Show the panels' : 'Hide the panels');
+    this.dom.hideButton.title = hidden ? 'Show the panels (H)' : 'Hide the panels (H)';
+    this.layout();
   }
 
   private async toggleFullscreen(): Promise<void> {
     try {
       if (document.fullscreenElement) await document.exitFullscreen();
-      else await this.dom.stage.requestFullscreen();
+      else await document.documentElement.requestFullscreen();
     } catch {
       this.toast("Full screen isn't available here.", 'error');
     }
   }
 
-  private setPanelOpen(open: boolean): void {
-    this.dom.app.classList.toggle('panel-open', open);
-    this.dom.panelButton.setAttribute('aria-expanded', String(open));
-  }
-
   // ─── Exports ─────────────────────────────────────────────
 
-  private fileBase(): string {
-    return `ascii3d-${slug(this.stage.info?.name ?? 'model')}-${timestamp()}`;
+  /** The name in the Download panel, made safe for a file system. */
+  private exportBase(): string {
+    const typed = (this.panel?.fileName ?? '')
+      .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '-')
+      .replace(/^[.\s-]+|[.\s]+$/g, '');
+    return typed || `ascii3d-${slug(this.stage.info?.name ?? 'model')}`;
   }
 
-  /** Renders one frame at `ratio` device pixels per CSS pixel and returns it as PNG. */
-  private async renderStill(ratio: number): Promise<Blob> {
+  /**
+   * Renders the frame alone, as its own canvas at `ratio`, runs `read` while
+   * those pixels are current, then puts the live view back. Nothing is
+   * painted in between, so the screen never shows the intermediate size.
+   */
+  private renderFrame<T>(ratio: number, read: () => T): T {
+    const f = this.frameRect;
+    const u = this.asciiPass.uniforms;
+    const lens = u.uLens.value as number;
     this.exporting = true;
     try {
-      if (ratio !== this.pixelRatio) this.applySize(ratio);
+      u.uLens.value = 0;
+      this.applySize(f.w, f.h, { x: 0, y: 0, w: f.w, h: f.h }, ratio);
       this.composer.render(0);
-      const blob = await new Promise<Blob | null>((resolve) => this.dom.canvas.toBlob(resolve, 'image/png'));
-      if (!blob) throw new Error('The browser could not encode the image.');
-      return blob;
+      return read();
     } finally {
-      if (ratio !== this.pixelRatio) this.applySize(this.pixelRatio);
+      u.uLens.value = lens;
+      this.applySize(this.cssWidth, this.cssHeight, this.frameRect, this.pixelRatio);
+      this.composer.render(0);
       this.exporting = false;
     }
   }
 
+  private copyCanvas(): HTMLCanvasElement {
+    const source = this.dom.canvas;
+    const copy = document.createElement('canvas');
+    copy.width = source.width;
+    copy.height = source.height;
+    copy.getContext('2d')?.drawImage(source, 0, 0);
+    return copy;
+  }
+
+  /** Copies the frame's pixels out of the live canvas (call right after rendering). */
+  private copyFrameTo(ctx: CanvasRenderingContext2D, target: HTMLCanvasElement): void {
+    const f = this.frameRect;
+    const r = this.pixelRatio;
+    ctx.clearRect(0, 0, target.width, target.height);
+    ctx.drawImage(this.dom.canvas, f.x * r, f.y * r, f.w * r, f.h * r, 0, 0, target.width, target.height);
+  }
+
   async savePng(): Promise<void> {
     if (this.recorder) {
-      // A high-resolution still resizes the canvas, which would corrupt the video.
+      // A high-resolution still resizes the renderer, which would show in the video.
       this.toast('Stop the recording before saving an image.', 'error');
       return;
     }
     // N× the on-screen resolution, capped by what the GPU can render in one pass.
     const gl = this.renderer.getContext();
     const maxSide = Math.min(8192, gl.getParameter(gl.MAX_RENDERBUFFER_SIZE), gl.getParameter(gl.MAX_TEXTURE_SIZE));
-    const requested = this.panel?.pngScale ?? 1;
-    const ratio = Math.min(this.pixelRatio * requested, maxSide / Math.max(this.cssWidth, this.cssHeight));
+    const f = this.frameRect;
+    const ratio = Math.min(this.pixelRatio * (this.panel?.pngScale ?? 1), maxSide / Math.max(f.w, f.h));
     try {
-      const blob = await this.renderStill(ratio);
-      const outcome = await saveFile(`${this.fileBase()}.png`, blob);
-      if (outcome === 'saved') this.toast('PNG saved.');
+      const still = this.renderFrame(ratio, () => this.copyCanvas());
+      const blob = await new Promise<Blob | null>((resolve) => still.toBlob(resolve, 'image/png'));
+      if (!blob) throw new Error('The browser could not encode the image.');
+      const outcome = await saveFile(`${this.exportBase()}.png`, blob);
+      if (outcome === 'saved') this.toast(`PNG saved, ${still.width}×${still.height}.`);
     } catch (error) {
       this.toast(errorMessage(error), 'error');
     }
@@ -550,6 +754,17 @@ export class App {
     return 6;
   }
 
+  private videoSeconds(): number {
+    const length = this.panel?.videoLength ?? 'loop';
+    return length === 'loop' ? this.loopSeconds() : length;
+  }
+
+  private syncRecordButton(): void {
+    const length = this.panel?.videoLength ?? 'loop';
+    const sub = length === 'loop' ? 'One full turn, saved as video' : `${length} seconds, saved as video`;
+    if (this.dom.recordSub.textContent !== sub) this.dom.recordSub.textContent = sub;
+  }
+
   toggleRecording(): void {
     if (this.recorder) {
       this.recorder.stop();
@@ -560,79 +775,98 @@ export class App {
       this.toast("This browser can't record canvas video. Try Chrome, Edge or Firefox.", 'error');
       return;
     }
-    const length = this.panel?.videoLength ?? 'loop';
-    const seconds = length === 'loop' ? this.loopSeconds() : length;
+    const seconds = this.videoSeconds();
+    // The frame is copied into its own canvas every frame; video encoders want even sizes.
+    const f = this.frameRect;
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(2, Math.round(f.w * this.pixelRatio) & ~1);
+    canvas.height = Math.max(2, Math.round(f.h * this.pixelRatio) & ~1);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      this.toast('Canvas 2D is unavailable, so the video could not be recorded.', 'error');
+      return;
+    }
     let recorder: CanvasRecorder;
     try {
-      recorder = new CanvasRecorder(this.dom.canvas, seconds, format);
+      recorder = new CanvasRecorder(canvas, seconds, format);
     } catch (error) {
       this.toast(errorMessage(error), 'error');
       return;
     }
     this.recorder = recorder;
-    this.dom.recordButton.classList.add('recording');
-    this.dom.recordTime.hidden = false;
-    const tick = window.setInterval(() => {
+    this.recordTarget = { canvas, ctx };
+    const { recordButton, recordTitle, recordSub } = this.dom;
+    recordButton.classList.add('recording');
+    recordTitle.textContent = 'Stop recording';
+    const update = () => {
       const label = `${formatSeconds(recorder.elapsed)} / ${formatSeconds(seconds)}`;
-      this.dom.recordTime.textContent = label;
+      recordSub.textContent = label;
       this.panel?.setRecording(true, `Stop · ${label}`);
-    }, 200);
-    this.panel?.setRecording(true);
+    };
+    update();
+    const timer = window.setInterval(update, 200);
 
     recorder.finished
-      .then((blob) => saveFile(`${this.fileBase()}.${recorder.extension}`, blob))
+      .then((blob) => saveFile(`${this.exportBase()}.${recorder.extension}`, blob))
       .then((outcome) => outcome === 'saved' && this.toast(`Video saved (${recorder.extension.toUpperCase()}).`))
       .catch((error) => this.toast(errorMessage(error), 'error'))
       .finally(() => {
-        window.clearInterval(tick);
+        window.clearInterval(timer);
         this.recorder = null;
-        this.dom.recordButton.classList.remove('recording');
-        this.dom.recordTime.hidden = true;
+        this.recordTarget = null;
+        recordButton.classList.remove('recording');
+        recordTitle.textContent = 'Record a loop';
+        this.syncRecordButton();
         this.panel?.setRecording(false);
       });
   }
 
   private asciiGrid(): AsciiCell[][] {
-    const s = this.store.value;
+    const look = this.look();
     const data = this.asciiPass.readCells(this.renderer);
-    return cellsToAscii(data, this.asciiPass.cols, this.asciiPass.rows, rampFor(s), {
-      ...s,
+    return cellsToAscii(data, this.asciiPass.cols, this.asciiPass.rows, rampFor(look), {
+      ...look,
       cellAspect: this.asciiPass.cellWidth / this.asciiPass.cellHeight,
     });
   }
 
+  /** The characters inside the frame, from a render of the frame alone. */
+  private frameGrid(): AsciiCell[][] {
+    return this.renderFrame(this.pixelRatio, () => this.asciiGrid());
+  }
+
   async copyAscii(): Promise<void> {
-    const text = asciiToText(this.asciiGrid());
+    const text = asciiToText(this.frameGrid());
     if (!text) return this.toast('The frame is empty; there is nothing to copy.', 'error');
     const ok = await copyText(text);
-    this.toast(ok ? `Copied ${text.split('\n').length} lines of ASCII.` : 'Copy was blocked. Use Save .txt instead.', ok ? 'info' : 'error');
+    this.toast(ok ? `Copied ${text.split('\n').length} lines of ASCII.` : 'Copy was blocked. Export as text instead.', ok ? 'info' : 'error');
   }
 
   async saveAscii(): Promise<void> {
-    const text = asciiToText(this.asciiGrid());
+    const text = asciiToText(this.frameGrid());
     if (!text) return this.toast('The frame is empty; there is nothing to save.', 'error');
-    await this.trySave(`${this.fileBase()}.txt`, text, 'Text saved.');
+    await this.trySave(`${this.exportBase()}.txt`, text, 'Text saved.');
   }
 
   async saveSvg(): Promise<void> {
-    const s = this.store.value;
+    const look = this.look();
     const ratio = this.pixelRatio;
     const cellWidth = this.asciiPass.cellWidth / ratio;
     const cellHeight = this.asciiPass.cellHeight / ratio;
     const ctx = document.createElement('canvas').getContext('2d');
     if (!ctx) return this.toast('Canvas 2D is unavailable, so the SVG could not be built.', 'error');
-    const family = FONTS[s.font].family;
-    const svg = buildSvg({
-      grid: this.asciiGrid(),
+    const family = FONTS[look.font].family;
+    const svgText = buildSvg({
+      grid: this.frameGrid(),
       cellWidth,
       cellHeight,
-      metrics: measureGlyphMetrics(ctx, family, s.bold, cellWidth, cellHeight, s.glyphScale),
+      metrics: measureGlyphMetrics(ctx, family, look.bold, cellWidth, cellHeight, look.glyphScale),
       fontStack: fontStack(family),
-      bold: s.bold,
-      background: s.transparentBg ? null : s.bg,
-      colorOf: glyphColorFn(s),
+      bold: look.bold,
+      background: look.transparentBg ? null : look.bg,
+      colorOf: glyphColorFn(look),
     });
-    await this.trySave(`${this.fileBase()}.svg`, svg, 'SVG saved.');
+    await this.trySave(`${this.exportBase()}.svg`, svgText, 'SVG saved.');
   }
 
   private async trySave(filename: string, data: Blob | string, done: string): Promise<void> {
@@ -645,7 +879,27 @@ export class App {
 
   async saveLook(): Promise<void> {
     const body = JSON.stringify({ app: 'ascii-3d-studio', version: 1, settings: this.store.value }, null, 2);
-    await this.trySave(`ascii3d-look-${timestamp()}.json`, body, 'Look saved.');
+    await this.trySave(`${this.exportBase()}-look.json`, body, 'Look saved.');
+  }
+
+  private runExport(): void {
+    switch (this.panel?.format ?? 'png') {
+      case 'png':
+        void this.savePng();
+        break;
+      case 'video':
+        this.toggleRecording();
+        break;
+      case 'svg':
+        void this.saveSvg();
+        break;
+      case 'txt':
+        void this.saveAscii();
+        break;
+      case 'json':
+        void this.saveLook();
+        break;
+    }
   }
 
   private pickLookFile(): void {
@@ -662,87 +916,243 @@ export class App {
       const settings = sanitizeSettings(json && typeof json === 'object' && 'settings' in json ? json.settings : json);
       if (!Object.keys(settings).length) throw new Error('empty');
       this.store.set({ ...defaultSettings(), ...settings });
-      this.toast(`Applied look from ${file.name}.`);
+      this.toast(`Applied the look from ${file.name}.`);
     } catch {
       this.toast(`${file.name} isn't a look file saved from this tool.`, 'error');
     }
   }
 
+  // ─── Sharing & embeds ────────────────────────────────────
+
+  /**
+   * A link back to this site with the model and the look in it. An embed link
+   * carries the look as rendered, so it no longer follows anyone's theme.
+   */
   private shareUrl(embed: boolean): URL {
     const url = new URL(location.pathname, location.origin);
     const source = this.stage.info?.source;
     if (source?.kind === 'sample') url.searchParams.set('model', `sample:${source.id}`);
     if (source?.kind === 'url') url.searchParams.set('model', source.url);
-    if (embed) url.searchParams.set('embed', '1');
-    const encoded = encodeSettings(diffFromDefaults(this.store.value));
+    if (embed) {
+      url.searchParams.set('embed', '1');
+      if (this.panel && !this.panel.embedOrbit) url.searchParams.set('controls', '0');
+      if (this.stage.activeClip > 0) url.searchParams.set('clip', String(this.stage.activeClip));
+    }
+    const encoded = encodeSettings(diffFromDefaults(embed ? this.look() : this.store.value));
     if (encoded !== encodeSettings({})) url.hash = `s=${encoded}`;
     return url;
   }
 
-  private async copyShare(embed: boolean): Promise<void> {
-    const url = this.shareUrl(embed).href;
-    const payload = embed
-      ? `<iframe src="${url}" title="ASCII 3D" style="width:100%;aspect-ratio:16/9;border:0" loading="lazy" allowfullscreen></iframe>`
-      : url;
-    const ok = await copyText(payload);
-    if (!ok) return this.toast('Copy was blocked by the browser.', 'error');
-    const local = this.stage.info?.source.kind === 'file';
-    this.toast(
-      local
-        ? `${embed ? 'Embed code' : 'Link'} copied. Uploaded files aren't included: host the model (e.g. in /public/models) and load it by URL first.`
-        : `${embed ? 'Embed code' : 'Link'} copied.`,
-      'info',
-      local ? 7000 : 3200,
-    );
+  private embedTitle(): string {
+    return `${this.stage.info?.name ?? 'Model'} in ASCII`;
+  }
+
+  private async copyShareLink(): Promise<void> {
+    const ok = await copyText(this.shareUrl(false).href);
+    this.toast(ok ? 'Link copied. It opens this model with this look.' : 'Copy was blocked by the browser.', ok ? 'info' : 'error');
+  }
+
+  /** For a model that is already online (a sample or a public link): the code works as it is. */
+  private async copyEmbedCode(): Promise<void> {
+    const code = iframeCode(this.shareUrl(true).href, this.panel?.embedShape ?? '16/9', this.embedTitle());
+    this.panel?.showEmbedCode(code);
+    const ok = await copyText(code);
+    this.toast(ok ? 'Embed code copied. Paste it into your page’s HTML.' : 'Copy was blocked; select the code below and copy it.', ok ? 'info' : 'error');
+  }
+
+  /** Step 3 of the private embed: the link to the page the person put online. */
+  private async copyHostedEmbed(raw: string): Promise<void> {
+    if (!raw) {
+      this.toast('Paste the link to your hosted embed first, like https://my-embed.vercel.app', 'error');
+      return;
+    }
+    let url: URL;
+    try {
+      url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`);
+    } catch {
+      this.toast("That doesn't look like a link. It should start with https://", 'error');
+      return;
+    }
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+      this.toast('The link should start with https://', 'error');
+      return;
+    }
+    const code = iframeCode(url.href, this.panel?.embedShape ?? '16/9', this.embedTitle());
+    this.panel?.showEmbedCode(code);
+    const ok = await copyText(code);
+    this.toast(ok ? 'Embed code copied. Paste it into your page’s HTML.' : 'Copy was blocked; select the code below and copy it.', ok ? 'info' : 'error');
+  }
+
+  /**
+   * The model for an embed page: the file exactly as loaded when it can travel
+   * alone, otherwise a fresh .glb written from what is on screen. The
+   * procedural samples are rebuilt from their name.
+   */
+  private async embedModel(): Promise<{ sample: SampleId } | { bytes: Uint8Array<ArrayBuffer> }> {
+    const source = this.stage.info?.source;
+    if (source?.kind === 'sample' && source.id !== 'fox') return { sample: source.id };
+    const glb = this.current?.glb;
+    if (glb && glbIsPortable(glb)) return { bytes: new Uint8Array(glb) };
+    return { bytes: await this.exportGlb() };
+  }
+
+  private async exportGlb(): Promise<Uint8Array<ArrayBuffer>> {
+    const current = this.current;
+    if (!current) throw new Error('Load a model first.');
+    const { GLTFExporter } = await import('three/examples/jsm/exporters/GLTFExporter.js');
+    // Pack the model's own materials; the embed applies the shading itself.
+    this.stage.setShading('original');
+    try {
+      const result = await new GLTFExporter().parseAsync(current.object, {
+        binary: true,
+        animations: current.clips,
+        onlyVisible: true,
+      });
+      if (!(result instanceof ArrayBuffer)) throw new Error('The model could not be packed for the embed.');
+      return new Uint8Array(result);
+    } catch (error) {
+      throw new Error(`The model could not be packed for the embed: ${errorMessage(error)}`);
+    } finally {
+      this.stage.setShading(this.store.value.shading);
+    }
+  }
+
+  /** Step 1 of the private embed: one page with this app, the model and the look inside it. */
+  private async downloadEmbed(kind: 'zip' | 'html'): Promise<void> {
+    const info = this.stage.info;
+    if (!info || this.embedBusy) return;
+    if (import.meta.env.DEV) {
+      this.toast('Embeds are packed from the built app: run npm run build, then npm run preview, or use the deployed site.', 'error', 8000);
+      return;
+    }
+    this.embedBusy = true;
+    this.panel?.setEmbedBusy(kind);
+    try {
+      const [code, model] = await Promise.all([collectAppCode(), this.embedModel()]);
+      const look = this.look();
+      const files: ZipEntry[] = [];
+      let embedModel: EmbedModel;
+      if ('sample' in model) embedModel = { kind: 'sample', id: model.sample };
+      else if (kind === 'zip') {
+        embedModel = { kind: 'url', url: 'model.glb', name: info.name };
+        files.push({ name: 'model.glb', data: model.bytes });
+      } else {
+        embedModel = { kind: 'data', name: info.name, base64: bytesToBase64(model.bytes) };
+      }
+      const config: EmbedConfig = {
+        settings: diffFromDefaults(look),
+        model: embedModel,
+        orbit: this.panel?.embedOrbit ?? true,
+        clip: this.stage.activeClip >= 0 ? this.stage.activeClip : undefined,
+      };
+      const page = buildEmbedPage({
+        code,
+        shell: this.options.shell,
+        config,
+        title: this.embedTitle(),
+        theme: relativeLuminance(look.bg) > LIGHT_GROUND ? 'light' : 'dark',
+        ground: look.transparentBg ? 'transparent' : look.bg,
+      });
+      const base = `${this.exportBase()}-embed`;
+      const outcome =
+        kind === 'zip'
+          ? await saveFile(`${base}.zip`, await buildZip([{ name: 'index.html', data: page }, ...files]))
+          : await saveFile(`${base}.html`, page);
+      if (outcome === 'saved') {
+        this.toast(
+          kind === 'zip'
+            ? 'Embed saved. Drag the .zip onto vercel.com/drop, then paste the link it gives you in step 3.'
+            : 'Embed saved. Upload the .html to any web host, then paste its link in step 3.',
+          'info',
+          8000,
+        );
+      }
+    } catch (error) {
+      this.toast(errorMessage(error), 'error');
+    } finally {
+      this.embedBusy = false;
+      this.panel?.setEmbedBusy(null);
+    }
   }
 
   // ─── Input ───────────────────────────────────────────────
 
-  private panelActions() {
+  private panelActions(): PanelActions {
     return {
-      applyPreset: (id: string) => {
+      openFilePicker: () => this.dom.fileInput.click(),
+      loadFiles: (files) => void this.loadFiles(files),
+      loadSample: (id) => void this.loadSample(id),
+      loadUrl: (url) => void this.loadUrl(url),
+      playClip: (index) => this.stage.playClip(index),
+      toggleMotion: () => this.setMotionPaused(!this.stage.motionPaused),
+      resetView: () => this.stage.resetView(),
+      applyPreset: (id) => {
         const preset = PRESETS.find((p) => p.id === id);
         if (preset) this.store.set(presetSettings(preset));
       },
-      randomize: () => this.store.set(randomLook(this.store.value)),
       resetAll: () => this.store.set(defaultSettings()),
-      loadSample: (id: SampleId) => void this.loadSample(id),
-      openFilePicker: () => this.dom.fileInput.click(),
-      loadUrl: (url: string) => void this.loadUrl(url),
-      playClip: (index: number) => this.stage.playClip(index),
-      toggleMotion: () => this.setMotionPaused(!this.stage.motionPaused),
-      resetView: () => this.stage.resetView(),
-      savePng: () => void this.savePng(),
-      toggleRecording: () => this.toggleRecording(),
+      runExport: () => this.runExport(),
       copyText: () => void this.copyAscii(),
-      saveText: () => void this.saveAscii(),
-      saveSvg: () => void this.saveSvg(),
-      saveLook: () => void this.saveLook(),
       loadLook: () => this.pickLookFile(),
-      copyShareLink: () => void this.copyShare(false),
-      copyEmbedCode: () => void this.copyShare(true),
+      copyEmbedCode: () => void this.copyEmbedCode(),
+      copyShareLink: () => void this.copyShareLink(),
+      downloadEmbed: (kind) => void this.downloadEmbed(kind),
+      copyHostedEmbed: (url) => void this.copyHostedEmbed(url),
+      startTour: () => this.tour.start(),
     };
   }
 
-  private bindStageButtons(): void {
+  private bindChrome(): void {
     const { dom } = this;
-    dom.uploadButton.addEventListener('click', () => dom.fileInput.click());
+    dom.hideButton.replaceChildren(svg('eye'));
+    dom.fullscreenButton.replaceChildren(svg('expand'));
+    dom.soundButton.replaceChildren(svg('sound'));
     dom.fileInput.addEventListener('change', () => {
       const files = [...(dom.fileInput.files ?? [])];
       dom.fileInput.value = '';
       if (files.length) void this.loadFiles(files);
     });
-    dom.snapshotButton.addEventListener('click', () => void this.savePng());
-    dom.recordButton.addEventListener('click', () => this.toggleRecording());
-    dom.fullscreenButton.addEventListener('click', () => void this.toggleFullscreen());
     dom.hideButton.addEventListener('click', () => this.toggleUi());
-    dom.panelButton.addEventListener('click', () => this.setPanelOpen(!dom.app.classList.contains('panel-open')));
-    dom.canvas.addEventListener('pointerdown', () => this.setPanelOpen(false));
+    dom.fullscreenButton.addEventListener('click', () => void this.toggleFullscreen());
+    dom.randomButton.addEventListener('click', () => this.store.set(randomLook(this.store.value)));
+    dom.recordButton.addEventListener('click', () => this.toggleRecording());
+    this.syncRecordButton();
+  }
 
-    // The orbit hint only matters until the first interaction.
-    const dismissHint = () => dom.hint.classList.add('dismissed');
-    dom.canvas.addEventListener('pointerdown', dismissHint, { once: true });
-    window.setTimeout(dismissHint, 15_000);
+  private bindThemeSwitch(): void {
+    this.dom.themeSwitch.querySelectorAll<HTMLButtonElement>('button[data-v]').forEach((b) => {
+      b.replaceChildren(svg(b.dataset.v === 'dark' ? 'dark' : 'light'));
+      b.addEventListener('click', () => this.setTheme(b.dataset.v === 'dark' ? 'dark' : 'light'));
+    });
+    this.syncThemeSwitch();
+  }
+
+  /** On a phone the studio doesn't fit, so a card says what it is and hands over the link. */
+  private bindPhone(): void {
+    const { mob, mobSheet, mobCopy, mobOpen, app } = this.dom;
+    mob.querySelector('.mob-brand')?.insertAdjacentHTML('afterbegin', LOGO_MARK);
+    const phone = matchMedia('(max-width: 760px)');
+    let stop: (() => void) | null = null;
+    const sync = () => {
+      const show = phone.matches && !app.classList.contains('mobOpen');
+      if (show && !stop) stop = spinTorus(mobSheet, 58, 24);
+      else if (!show && stop) {
+        stop();
+        stop = null;
+      }
+    };
+    phone.addEventListener('change', sync);
+    sync();
+    mobCopy.addEventListener('click', async () => {
+      const ok = await copyText(location.href.split('#')[0]);
+      this.toast(ok ? 'Link copied. Open it on a computer for the whole studio.' : 'Copy was blocked by the browser.', ok ? 'info' : 'error');
+    });
+    mobOpen.addEventListener('click', () => {
+      app.classList.add('mobOpen');
+      sync();
+      window.scrollTo(0, 0);
+      this.scheduleLayout();
+    });
   }
 
   private bindDragAndDrop(): void {
@@ -778,10 +1188,10 @@ export class App {
     window.addEventListener('keydown', (e) => {
       if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
       const target = e.target as HTMLElement | null;
-      if (target?.closest('input, select, textarea, [contenteditable="true"]')) return;
+      if (target?.closest('input, select, textarea, [contenteditable="true"], .tour')) return;
       const key = e.key.toLowerCase();
       if (key === ' ') {
-        if (target?.closest('button')) return;
+        if (target?.closest('button, summary, a, [role="option"]')) return;
         e.preventDefault();
         this.setMotionPaused(!this.stage.motionPaused);
       } else if (key === 'h') this.toggleUi();
@@ -790,8 +1200,10 @@ export class App {
       else if (key === 'f') void this.toggleFullscreen();
       else if (key === 'u' || key === 'o') this.dom.fileInput.click();
       else if (key === 'x') this.store.set(randomLook(this.store.value));
-      else if (key === 'escape') this.setPanelOpen(false);
-      else if (/^[1-9]$/.test(key) && PRESETS[Number(key) - 1]) this.store.set(presetSettings(PRESETS[Number(key) - 1]));
+      else if (/^[0-9]$/.test(key)) {
+        const preset = PRESETS[key === '0' ? 9 : Number(key) - 1];
+        if (preset) this.store.set(presetSettings(preset));
+      }
     });
   }
 
@@ -801,8 +1213,10 @@ export class App {
       const rect = canvas.getBoundingClientRect();
       const x = e.clientX - rect.left;
       const y = e.clientY - rect.top;
-      this.pointer.x = Math.max(-1.5, Math.min(1.5, (x / rect.width) * 2 - 1));
-      this.pointer.y = Math.max(-1.5, Math.min(1.5, 1 - (y / rect.height) * 2));
+      // Follow the cursor relative to the frame, where the model is.
+      const f = this.frameRect;
+      this.pointer.x = Math.max(-1.5, Math.min(1.5, ((x - f.x) / f.w) * 2 - 1));
+      this.pointer.y = Math.max(-1.5, Math.min(1.5, 1 - ((y - f.y) / f.h) * 2));
       this.pointer.active = true;
       this.lens.inside = e.target === canvas && x >= 0 && y >= 0 && x <= rect.width && y <= rect.height;
       this.lens.x = x * this.pixelRatio;
@@ -829,14 +1243,6 @@ export class App {
   private toast(message: string, kind: 'info' | 'error' = 'info', duration?: number): void {
     this.toaster.show(message, kind, duration);
   }
-}
-
-function relativeLuminance(hex: string): number {
-  const channel = (i: number) => {
-    const c = parseInt(hex.slice(i, i + 2), 16) / 255;
-    return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
-  };
-  return 0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5);
 }
 
 function errorMessage(error: unknown): string {

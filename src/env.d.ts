@@ -18,4 +18,6 @@ interface Window {
   claude?: {
     use(name: 'downloads'): Promise<ClaudeDownloads | null>;
   };
+  /** Written into a downloaded embed page: the look, the model and the options it boots with. */
+  ASCII3D_EMBED?: import('./export/embed').EmbedConfig;
 }

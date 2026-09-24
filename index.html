@@ -1,94 +1,108 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-ui="light">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>ASCII 3D Studio</title>
     <meta
       name="description"
-      content="Turn any GLB or glTF 3D model into live, animated ASCII art. Upload a model, tune glyphs, color and effects, then export PNG, video, SVG or text."
+      content="Turn any GLB or glTF 3D model into live, animated ASCII art. Upload a model, pick a look, then export PNG, video, SVG, text or an embed for your website."
     />
-    <meta name="theme-color" content="#0e1013" />
+    <meta name="theme-color" content="#ffffff" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
       rel="stylesheet"
-      href="https://fonts.googleapis.com/css2?family=Courier+Prime:wght@400;700&family=IBM+Plex+Mono:wght@400;500;700&family=IBM+Plex+Sans+Condensed:wght@400;500;600&family=JetBrains+Mono:wght@400;700&family=Major+Mono+Display&family=Martian+Mono:wght@400;700&family=Space+Mono:wght@400;700&family=VT323&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Courier+Prime:wght@400;700&family=IBM+Plex+Mono:wght@400;700&family=JetBrains+Mono:wght@400;500;700&family=Martian+Mono:wght@400;700&family=Space+Grotesk:wght@400;500;600&family=Space+Mono:wght@400;700&family=VT323&display=swap"
     />
+    <script>
+      /* Set the interface theme before first paint, so it never flashes. */
+      try {
+        var ui = localStorage.getItem('ascii3d:ui');
+        if (ui !== 'dark' && ui !== 'light') ui = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        document.documentElement.setAttribute('data-ui', ui);
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div class="app" id="app">
+      <section class="mob" id="mob" aria-label="ASCII 3D on a phone">
+        <div class="mob-brand" id="mob-brand"><b>ASCII 3D</b></div>
+        <p>
+          Turn a 3D model into live ASCII art in the browser: upload a GLB, pick a look, and export PNG, video, SVG or an
+          embed for your website.
+        </p>
+        <pre class="mob-sheet" id="mob-sheet" aria-hidden="true"></pre>
+        <div class="mob-acts">
+          <button class="btn primary" id="mob-copy" type="button">Copy the link</button>
+          <button class="btn ghost" id="mob-open" type="button">Open it here anyway</button>
+        </div>
+        <p class="mob-note">Built for a desktop screen.</p>
+      </section>
+
+      <aside class="left" id="rail-left" aria-label="Model and output"></aside>
+
       <main class="stage" id="stage">
         <div class="viewport" id="viewport">
-          <div class="frame" id="frame">
-            <canvas id="view" role="img" aria-label="ASCII rendering of the current 3D model"></canvas>
+          <canvas id="view" role="img" aria-label="ASCII rendering of the current 3D model"></canvas>
+        </div>
+        <div class="framemarks" id="framemarks" hidden><i></i><i></i><i></i><i></i></div>
+
+        <div class="stagebar" id="stagebar">
+          <div class="seg" id="seg-ui" role="group" aria-label="Interface theme">
+            <button type="button" data-v="light" aria-pressed="true" title="Light mode" aria-label="Light mode"></button>
+            <button type="button" data-v="dark" aria-pressed="false" title="Dark mode" aria-label="Dark mode"></button>
+          </div>
+          <p class="telemetry" id="telemetry" aria-hidden="true"></p>
+          <div class="stageacts">
+            <button type="button" class="iconbtn" id="act-hide" title="Hide the panels (H)" aria-label="Hide the panels"></button>
+            <button type="button" class="iconbtn" id="act-fullscreen" title="Full screen (F)" aria-label="Full screen"></button>
+            <button type="button" class="iconbtn" id="btn-sound" aria-pressed="true" title="Interface sound" aria-label="Interface sound"></button>
           </div>
         </div>
 
-        <header class="brand">
-          <span class="wordmark" aria-label="ASCII 3D">ascii·3d</span>
-          <span class="brand-model" id="model-name">Loading model…</span>
-        </header>
-
-        <div class="stage-actions" id="stage-actions">
-          <button type="button" class="btn btn-primary" id="act-upload" title="Upload a model (U)">
-            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 10.5V2.5M4.5 6 8 2.5 11.5 6M2.5 10.5v3h11v-3" /></svg>
-            <span>Upload model</span>
+        <div class="cta" id="cta">
+          <button class="ctabtn fp" id="btn-random" type="button" title="Random look (X)">
+            <i class="si" data-ic="shuffle"></i>
+            <span class="st">Randomize<em>Try a different look</em></span>
+            <b class="ctachev"></b>
           </button>
-          <button type="button" class="icon-btn" id="act-snapshot" title="Save PNG (S)" aria-label="Save PNG">
-            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 5h2.2l1.1-1.8h4.4L11.3 5h2.2v7.8h-11z" /><circle cx="8" cy="8.7" r="2.3" /></svg>
+          <button class="ctabtn fp" id="btn-record" type="button">
+            <i class="si" data-ic="video"></i>
+            <span class="st"><span id="rec-title">Record a loop</span><em id="rec-sub">One full turn, saved as video</em></span>
+            <b class="ctachev"></b>
           </button>
-          <button type="button" class="icon-btn" id="act-record" title="Record video" aria-label="Record video">
-            <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="4.2" /></svg>
-            <span class="rec-time" id="rec-time" hidden></span>
-          </button>
-          <button type="button" class="icon-btn" id="act-fullscreen" title="Full screen (F)" aria-label="Full screen">
-            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10" /></svg>
-          </button>
-          <button type="button" class="icon-btn" id="act-hide" title="Hide interface (H)" aria-label="Hide interface">
-            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.8 8S4.2 3.8 8 3.8 14.2 8 14.2 8 11.8 12.2 8 12.2 1.8 8 1.8 8z" /><circle cx="8" cy="8" r="1.9" /></svg>
-          </button>
-          <button type="button" class="icon-btn only-narrow" id="act-panel" title="Settings" aria-label="Open settings" aria-controls="inspector" aria-expanded="false">
-            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4.5h6M11.5 4.5h2M2.5 11.5h2M7.5 11.5h6" /><circle cx="10" cy="4.5" r="1.5" /><circle cx="6" cy="11.5" r="1.5" /></svg>
-          </button>
-        </div>
-
-        <footer class="telemetry" id="telemetry" aria-hidden="true"></footer>
-        <p class="hint" id="hint">Drag to orbit · Scroll to zoom · Drop a .glb anywhere</p>
-
-        <div class="dropzone" id="dropzone" hidden>
-          <div class="dropzone-inner">
-            <pre class="dropzone-art" aria-hidden="true">
- ┌──────────────┐
- │  ▒▒▒▒▒▒▒▒▒▒  │
- │  ▒▒ DROP ▒▒  │
- │  ▒▒▒▒▒▒▒▒▒▒  │
- └──────┬───────┘
-        ▼</pre>
-            <p class="dropzone-title">Drop to scan</p>
-            <p class="dropzone-sub">.glb · .gltf (+ .bin, textures) · .fbx · .obj · .stl</p>
-          </div>
         </div>
 
         <div class="loading" id="loading" hidden>
-          <p class="loading-label" id="loading-label">Loading</p>
-          <p class="loading-bar" id="loading-bar" aria-hidden="true"></p>
-        </div>
-
-        <div class="fatal" id="fatal" hidden>
-          <p class="fatal-title">WebGL isn't available</p>
-          <p class="fatal-body" id="fatal-body">
-            This tool needs WebGL 2 to render. Try an up-to-date Chrome, Edge, Firefox or Safari, and check that hardware
-            acceleration is turned on.
-          </p>
+          <span id="loading-label">Loading</span>
+          <span class="bar" id="loading-bar" aria-hidden="true"></span>
         </div>
       </main>
 
-      <aside class="inspector" id="inspector" aria-label="Settings"></aside>
+      <aside class="right" id="rail-right" aria-label="Look controls"></aside>
     </div>
 
-    <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+    <div class="dropzone" id="dropzone" hidden>
+      <div class="dropcard">
+        <i class="si" data-ic="cube"></i>
+        <b>Drop to load</b>
+        <span>GLB · glTF with its .bin and textures · FBX · OBJ · STL</span>
+      </div>
+    </div>
+
+    <div class="fatal" id="fatal" hidden>
+      <div>
+        <b>WebGL isn't available</b>
+        <p>
+          This tool needs WebGL 2 to render. Try an up-to-date Chrome, Edge, Firefox or Safari, and check that hardware
+          acceleration is turned on.
+        </p>
+      </div>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
     <input type="file" id="file-input" multiple hidden />
     <script type="module" src="/src/main.ts"></script>
   </body>

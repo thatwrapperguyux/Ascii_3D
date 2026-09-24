@@ -2,7 +2,16 @@
 
 Turn any 3D model into live, animated ASCII art in the browser. Upload a `.glb`
 (or `.gltf`, `.fbx`, `.obj`, `.stl`), tune the glyphs, color, lighting and
-effects, then export a PNG, a video, an SVG or plain text.
+effects, then export a PNG, a video, an SVG or plain text, or embed it on your
+website.
+
+The render fills the window and two glass panels float over it. The left
+panel covers what goes in and what comes out: **Your model**, **Look**,
+**Download** and **Embed**. The right panel covers how it looks: **Glyphs**,
+**Tone**, **Colour**, **Light**, **Motion** and **Effects**. The model is
+framed in the clear space between the panels. The bar above the render switches
+between light and dark mode and holds the full-screen, hide-panels and sound
+buttons. A short tour runs on the first visit.
 
 The look is inspired by the ASCII "scanning" visuals studios like Ozero have
 built for brands such as Finic: raw symbols turned into data-driven, living
@@ -29,14 +38,18 @@ graphics. This is an original implementation built on [three.js](https://threejs
   zoom, and fixed frames (16:9, 4:3, 1:1, 4:5, 9:16).
 - **Effects:** scan beam (5 directions), cursor lens, glow, flicker, background
   glyph field, cell grid, CRT lines, vignette, and a decode-in when a model loads.
-- **Looks:** 9 built-in presets (Scanner, Textured, Phosphor, Amber CRT,
-  Blueprint, Newsprint, Chroma, Thermal, Braille), a randomizer, and save/load of
-  your own looks as JSON.
-- **Export:** PNG at 1×, 2× or 4× (transparent if you like), video (MP4 or WebM,
-  including a seamless one-turn loop), plain text (copy or `.txt`) and SVG with
-  real text that you can edit in Figma or Illustrator.
-- **Share and embed:** copy a link or an `<iframe>` snippet that reproduces the
-  current look and model.
+- **Looks:** 10 built-in looks. **Mono** (the default) follows the light/dark
+  switch: ink on white, or white on black. The others set their own ground:
+  Scanner, Textured, Phosphor, Amber CRT, Chroma, Thermal, Braille, Blueprint
+  and Newsprint. There is also a randomizer, and you can save and load your own
+  looks as JSON.
+- **Export:** everything is captured from the frame between the panels: PNG at
+  1×, 2× or 4× (transparent if you like), video (MP4 or WebM, including a
+  seamless one-turn loop), plain text (copy or `.txt`) and SVG with real text
+  that you can edit in Figma or Illustrator.
+- **Share and embed:** copy a link that reproduces the current model and look,
+  or get an `<iframe>` for your website, including for models you uploaded (see
+  [Embed an uploaded model](#embed-an-uploaded-model)).
 
 Settings are remembered in your browser. Uploaded files never leave your device.
 
@@ -91,17 +104,47 @@ npm run preview    # serve the production build
 npm test           # unit tests
 ```
 
+## Embed an uploaded model
+
+A model you upload exists only in your browser, so another website can't load
+it until it's online. The **Embed** section in the left panel packages it for
+you in three steps:
+
+1. **Download the embed.** Choose **.zip** (an `index.html` plus your
+   `model.glb`) or **.html** (one file with the model inside it). The page
+   contains the whole renderer, the model and the current look. It doesn't
+   depend on this site, so it keeps working even if the studio moves.
+2. **Put it online.** Drag the .zip onto [vercel.com/drop](https://vercel.com/drop),
+   or upload the .html to any static host.
+3. **Paste its link** back into the Embed section and click **Copy embed code**.
+
+You get an iframe like this to paste into your page's HTML:
+
+```html
+<iframe src="https://your-embed.vercel.app/" title="Robot in ASCII"
+  style="width:100%;aspect-ratio:16/9;border:0;display:block"
+  loading="lazy" allowfullscreen></iframe>
+```
+
+Set **Shape** in the Embed section before copying to get 16:9, 4:3, 1:1, 4:5 or
+9:16. Turn off **Drag to orbit** before downloading if the embed should not
+respond to dragging and scrolling, e.g. for a page background. Draco- or
+Basis-compressed files, multi-file glTF, FBX, OBJ and STL are rewritten as a
+plain `.glb` for the embed. Other `.glb` files travel exactly as uploaded.
+
 ## Use it on your website
 
-Put your model in `public/models/` (for example `public/models/robot.glb`) and
-deploy. Then open the site with `?model=/models/robot.glb`, tune the look, and
-click **Export → Embed code**. You get an iframe like this:
+For a sample, or a model that is already online (loaded **From a link**), the
+Embed section gives you the code in one click, pointing back at this site. To
+host your own model with the studio, put it in `public/models/` (for example
+`public/models/robot.glb`), deploy, open the site with
+`?model=/models/robot.glb`, tune the look, and click **Copy embed code**:
 
 ```html
 <iframe
   src="https://your-app.vercel.app/?model=/models/robot.glb&embed=1#s=eyJ..."
-  title="ASCII 3D"
-  style="width:100%;aspect-ratio:16/9;border:0"
+  title="robot in ASCII"
+  style="width:100%;aspect-ratio:16/9;border:0;display:block"
   loading="lazy"
   allowfullscreen
 ></iframe>
@@ -115,7 +158,8 @@ URL options:
 | `preset` | `?preset=phosphor` | Start from a built-in look |
 | `embed` | `?embed=1` | Hide the interface (for iframes) |
 | `controls` | `?controls=0` | Turn off orbit and zoom, e.g. for page backgrounds |
-| `#s=` | `#s=eyJ...` | Settings from **Copy link** or **Embed code** |
+| `clip` | `?clip=2` | Animation clip to play |
+| `#s=` | `#s=eyJ...` | Settings from **Copy link** or **Copy embed code** |
 
 Models loaded from another domain must allow cross-origin requests (CORS).
 Files in `public/models/` are served with `Access-Control-Allow-Origin: *`
@@ -132,9 +176,10 @@ Files in `public/models/` are served with `Access-Control-Allow-Origin: *`
 | `H` | Hide or show the interface |
 | `F` | Full screen |
 | `X` | Random look |
-| `1`–`9` | Apply a built-in look |
+| `1`–`9`, `0` | Apply a built-in look |
 
-Double-click any slider label to reset it.
+Drag a slider row to change its value, or double-click it (or click the number)
+to type an exact one.
 
 ## How it works
 
@@ -155,12 +200,12 @@ mapping on the CPU (`src/ascii/mapping.ts`), so exports match the screen.
 
 ```
 src/
-  app.ts               wiring: renderer, UI, input, loading, exports
+  app.ts               wiring: renderer, layout, input, loading, exports, embeds
   ascii/               AsciiPass, shaders, glyph atlas, CPU mapping
-  scene/               stage (camera, lights, motion), loaders, shading, samples
-  state/               settings schema, presets, share links, store
-  ui/                  inspector panel, controls, toasts
-  export/              file saving, SVG builder, video recorder
+  scene/               stage (camera, framing, lights, motion), loaders, shading, samples
+  state/               settings schema, presets, theme-matched look, share links, store
+  ui/                  the two panels, controls, dropdowns, colour picker, tour, sounds
+  export/              file saving, SVG builder, video recorder, embed page, zip writer
 tests/                 unit tests (vitest)
 ```
 
@@ -171,4 +216,5 @@ tests/                 unit tests (vitest)
   [Khronos glTF Sample Assets](https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/Fox).
   See `public/models/CREDITS.md`.
 - Rendering: [three.js](https://threejs.org) (MIT).
+- Interface icons: [Iconoir](https://iconoir.com) (MIT), with a few drawn to match.
 - Fonts: served by Google Fonts under the SIL Open Font License.

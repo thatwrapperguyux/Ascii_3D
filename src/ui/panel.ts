@@ -1,6 +1,8 @@
+import { ACCEPTED_FILES } from '../scene/loaders';
 import { SAMPLES, type SampleId } from '../scene/samples';
 import type { ModelInfo } from '../scene/stage';
-import { PRESETS, presetSettings } from '../state/presets';
+import { THEME_GROUND, type UiTheme } from '../state/look';
+import { PRESETS, PRESET_GROUPS, presetSettings } from '../state/presets';
 import {
   CHARSETS,
   COLOR_MODES,
@@ -11,421 +13,710 @@ import {
   SHADINGS,
   rampFor,
   type CharsetId,
-  type ColorMode,
   type FontId,
-  type FrameId,
-  type ScanDirection,
   type SettingKey,
   type Settings,
-  type Shading,
 } from '../state/schema';
 import { readPref, writePref } from '../state/share';
 import type { SettingsStore } from '../state/store';
-import { color, custom, segmented, select, slider, text, toggle, type Control } from './controls';
-import { button, formatCount, h, icon } from './dom';
+import {
+  colorRow,
+  custom,
+  grp,
+  scrub,
+  selectRow,
+  textField,
+  tip,
+  toggle,
+  type Control,
+} from './controls';
+import { button, formatCount, h, si, svg } from './dom';
+import { Fsel, type FselOption } from './fsel';
+import { LOGO_MARK, type IconName } from './icons';
+
+export type ExportFormat = 'png' | 'video' | 'svg' | 'txt' | 'json';
+export type PngScale = 1 | 2 | 4;
+export type VideoLength = 'loop' | 5 | 10;
+export type EmbedShape = '16/9' | '4/3' | '1/1' | '4/5' | '9/16';
 
 export interface PanelActions {
-  applyPreset(id: string): void;
-  randomize(): void;
-  resetAll(): void;
-  loadSample(id: SampleId): void;
   openFilePicker(): void;
+  loadFiles(files: File[]): void;
+  loadSample(id: SampleId): void;
   loadUrl(url: string): void;
   playClip(index: number): void;
   toggleMotion(): void;
   resetView(): void;
-  savePng(): void;
-  toggleRecording(): void;
+  applyPreset(id: string): void;
+  resetAll(): void;
+  runExport(): void;
   copyText(): void;
-  saveText(): void;
-  saveSvg(): void;
-  saveLook(): void;
   loadLook(): void;
-  copyShareLink(): void;
   copyEmbedCode(): void;
+  copyShareLink(): void;
+  downloadEmbed(kind: 'zip' | 'html'): void;
+  copyHostedEmbed(url: string): void;
+  startTour(): void;
 }
 
 export interface PanelFeatures {
-  urlLoading: boolean;
-  sharing: boolean;
+  /** Load models by URL and share links (not possible inside the Artifact sandbox). */
+  network: boolean;
 }
-
-export type PngScale = 1 | 2 | 4;
-export type VideoLength = 'loop' | 5 | 10;
 
 interface SectionDef {
   id: string;
+  icon: IconName;
   title: string;
-  summary: (s: Readonly<Settings>) => string;
+  sub: string;
+  open: boolean;
   build: (body: HTMLElement) => void;
 }
 
-const DEFAULT_OPEN = ['presets', 'model', 'glyphs'];
-/** Motion and framing don't count against "this preset is active". */
+/** Motion and framing don't count against "this look is active". */
 const PRESET_IGNORED: SettingKey[] = ['spin', 'float', 'follow', 'fov', 'frame', 'animSpeed'];
 
-const entries = <T extends string>(labels: Record<T, string>) => Object.entries(labels) as [T, string][];
+const FORMATS: FselOption[] = [
+  { value: 'png', label: 'PNG image' },
+  { value: 'video', label: 'Video, MP4 or WebM' },
+  { value: 'svg', label: 'SVG with real text' },
+  { value: 'txt', label: 'Plain text (.txt)' },
+  { value: 'json', label: 'Look settings (.json)' },
+];
+
+const SHAPES: FselOption[] = [
+  { value: '16/9', label: '16:9 landscape' },
+  { value: '4/3', label: '4:3' },
+  { value: '1/1', label: '1:1 square' },
+  { value: '4/5', label: '4:5 portrait' },
+  { value: '9/16', label: '9:16 story' },
+];
+
+const entries = (labels: Record<string, string>): FselOption[] =>
+  Object.entries(labels).map(([value, label]) => ({ value, label }));
 
 export class Panel {
   private readonly controls: Control[] = [];
-  private readonly summaries: { el: HTMLElement; fn: (s: Readonly<Settings>) => string }[] = [];
   private readonly openSections: Set<string>;
-  private presetButtons: HTMLButtonElement[] = [];
-  private sampleButtons: HTMLButtonElement[] = [];
+  private publicModel = false;
+
+  // Built in the sections, updated later.
+  private lookFsel!: Fsel;
+  private modelName!: HTMLElement;
+  private sampleChips: HTMLButtonElement[] = [];
   private statsEl!: HTMLElement;
   private animBlock!: HTMLElement;
-  private clipSelect!: HTMLSelectElement;
-  private motionButton!: HTMLButtonElement;
-  private recordButton!: HTMLButtonElement;
-  private model: ModelInfo | null = null;
-  pngScale: PngScale = 1;
+  private clipFsel!: Fsel;
+  private motionBtn!: HTMLButtonElement;
+  private exportBtn!: HTMLButtonElement;
+  private scaleField!: HTMLElement;
+  private lengthField!: HTMLElement;
+  private transparentField!: HTMLElement;
+  private publicBlock!: HTMLElement;
+  private privateBlock!: HTMLElement;
+  private codeBox!: HTMLElement;
+  private hostedInput!: HTMLInputElement;
+  private embedButtons!: Record<'zip' | 'html', HTMLButtonElement>;
+
+  fileName = 'ascii3d';
+  format: ExportFormat = 'png';
+  pngScale: PngScale = 2;
   videoLength: VideoLength = 'loop';
+  embedShape: EmbedShape = '16/9';
+  embedOrbit = true;
 
   constructor(
-    private readonly root: HTMLElement,
+    private readonly left: HTMLElement,
+    private readonly right: HTMLElement,
     private readonly store: SettingsStore,
     private readonly actions: PanelActions,
     private readonly features: PanelFeatures,
+    private theme: UiTheme,
   ) {
-    let open: string[] = DEFAULT_OPEN;
+    let open: string[] | null = null;
     try {
       const saved = JSON.parse(readPref('sections') ?? 'null');
       if (Array.isArray(saved)) open = saved.filter((v): v is string => typeof v === 'string');
     } catch {
-      // Use defaults.
+      // Use each section's default.
     }
-    this.openSections = new Set(open);
-    const png = Number(readPref('pngScale'));
-    if (png === 1 || png === 2 || png === 4) this.pngScale = png;
-    const video = readPref('videoLength');
-    if (video === 'loop' || video === '5' || video === '10') this.videoLength = video === 'loop' ? 'loop' : (Number(video) as 5 | 10);
+    this.openSections = new Set(open ?? []);
+    const useDefaults = open === null;
 
-    this.render();
+    const format = readPref('format');
+    if (FORMATS.some((f) => f.value === format)) this.format = format as ExportFormat;
+    const scale = Number(readPref('pngScale'));
+    if (scale === 1 || scale === 2 || scale === 4) this.pngScale = scale;
+    const length = readPref('videoLength');
+    if (length === 'loop' || length === '5' || length === '10') this.videoLength = length === 'loop' ? 'loop' : (Number(length) as 5 | 10);
+    const shape = readPref('embedShape');
+    if (SHAPES.some((s) => s.value === shape)) this.embedShape = shape as EmbedShape;
+    this.embedOrbit = readPref('embedOrbit') !== 'off';
+
+    this.left.replaceChildren(this.brand());
+    for (const def of this.leftSections()) this.left.append(this.section(def, useDefaults));
+    this.left.append(this.credit());
+    this.right.replaceChildren();
+    for (const def of this.rightSections()) this.right.append(this.section(def, useDefaults));
+
     store.subscribe((_, s) => this.sync(s));
     this.sync(store.value);
+    this.syncExport();
   }
 
-  private render(): void {
-    this.root.replaceChildren(h('div', { class: 'sheet-handle', 'aria-hidden': 'true' }));
-    for (const section of this.sections()) this.root.append(this.renderSection(section));
+  // ─── Structure ───────────────────────────────────────────
+
+  private brand(): HTMLElement {
+    const mark = h('span', { class: 'logo-wrap', 'aria-hidden': 'true' });
+    mark.innerHTML = LOGO_MARK;
+    return h('div', { class: 'brand' }, mark.firstElementChild as HTMLElement, h('b', {}, 'ASCII 3D'), h('span', { class: 'ver' }, 'v1'));
   }
 
-  private renderSection(def: SectionDef): HTMLElement {
-    const bodyId = `sec-${def.id}`;
-    const open = this.openSections.has(def.id);
-    const meta = h('span', { class: 'section-meta' });
-    const head = h(
-      'button',
-      { type: 'button', class: 'section-head', 'aria-expanded': String(open), 'aria-controls': bodyId },
-      h('span', { class: 'section-title' }, def.title),
-      meta,
-      icon('chevron'),
+  private section(def: SectionDef, useDefaults: boolean): HTMLElement {
+    const open = useDefaults ? def.open : this.openSections.has(def.id);
+    if (open) this.openSections.add(def.id);
+    const body = h('div', { class: 'body' });
+    const details = h(
+      'details',
+      { class: 'sec fp', id: `sec-${def.id}`, open },
+      h('summary', {}, si(def.icon), h('span', { class: 'st' }, def.title, h('em', {}, def.sub))),
+      body,
     );
-    const body = h('div', { class: 'section-body', id: bodyId });
-    body.hidden = !open;
     def.build(body);
-    head.addEventListener('click', () => {
-      const next = body.hidden;
-      body.hidden = !next;
-      head.setAttribute('aria-expanded', String(next));
-      if (next) this.openSections.add(def.id);
+    details.addEventListener('toggle', () => {
+      if (details.open) this.openSections.add(def.id);
       else this.openSections.delete(def.id);
       writePref('sections', JSON.stringify([...this.openSections]));
     });
-    this.summaries.push({ el: meta, fn: def.summary });
-    return h('section', { class: 'section', 'data-section': def.id }, head, body);
+    return details;
   }
 
-  private add(body: HTMLElement, ...controls: Control[]): void {
-    for (const control of controls) {
-      this.controls.push(control);
-      body.append(control.el);
+  private add(body: HTMLElement, ...items: (Control | HTMLElement)[]): void {
+    for (const item of items) {
+      if (item instanceof HTMLElement) body.append(item);
+      else {
+        this.controls.push(item);
+        body.append(item.el);
+      }
     }
   }
 
-  private sections(): SectionDef[] {
+  // ─── Left rail: what goes in, what comes out ─────────────
+
+  private leftSections(): SectionDef[] {
+    return [
+      {
+        id: 'model',
+        icon: 'cube',
+        title: 'Your model',
+        sub: 'The 3D file and its animation',
+        open: true,
+        build: (body) => this.buildModel(body),
+      },
+      {
+        id: 'look',
+        icon: 'looks',
+        title: 'Look',
+        sub: 'Start from a finished style',
+        open: true,
+        build: (body) => this.buildLook(body),
+      },
+      {
+        id: 'download',
+        icon: 'export',
+        title: 'Download',
+        sub: 'Save a still, a clip or the text',
+        open: true,
+        build: (body) => this.buildDownload(body),
+      },
+      {
+        id: 'embed',
+        icon: 'code',
+        title: 'Embed',
+        sub: 'Put it on a website',
+        open: false,
+        build: (body) => this.buildEmbed(body),
+      },
+    ];
+  }
+
+  private buildModel(body: HTMLElement): void {
+    const input = h('input', { type: 'file', id: 'model-file', multiple: true, accept: ACCEPTED_FILES, 'aria-label': 'Upload a 3D model' });
+    const thumb = h('div', { class: 'thumb', 'aria-hidden': 'true' });
+    thumb.innerHTML = LOGO_MARK;
+    this.modelName = h('span', {}, 'GLB, glTF, FBX, OBJ or STL');
+    const drop = h('div', { class: 'drop', id: 'drop-model' }, thumb, h('div', { class: 'meta' }, h('b', {}, '3D model'), this.modelName), input);
+    input.addEventListener('change', () => {
+      const files = [...(input.files ?? [])];
+      input.value = '';
+      if (files.length) this.actions.loadFiles(files);
+    });
+    drop.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      drop.classList.add('over');
+    });
+    drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+    drop.addEventListener('drop', () => drop.classList.remove('over'));
+
+    this.sampleChips = SAMPLES.map((sample) => {
+      const chip = h('button', { type: 'button', class: 'chip', 'aria-pressed': 'false', title: sample.hint, 'data-id': sample.id }, sample.label);
+      chip.addEventListener('click', () => this.actions.loadSample(sample.id));
+      return chip;
+    });
+
+    this.statsEl = h('p', { class: 'stats' });
+    this.clipFsel = new Fsel('clip-select', 'Animation clip', []);
+    this.clipFsel.onChange((v) => this.actions.playClip(Number(v)));
+    this.motionBtn = button('Pause motion', { title: 'Pause or play all motion (Space)' }, 'pause');
+    this.motionBtn.addEventListener('click', () => this.actions.toggleMotion());
+    const speed = scrub(this.store, 'animSpeed', 'Speed', { unit: '×' });
+    this.controls.push(speed);
+    this.animBlock = h(
+      'div',
+      { class: 'body', style: 'padding:0' },
+      grp('Animation'),
+      h('div', { class: 'row2' }, h('label', { for: 'clip-select-btn' }, 'Clip'), this.clipFsel.el),
+      speed.el,
+      this.motionBtn,
+    );
+    this.animBlock.hidden = true;
+
+    body.append(drop, grp('Samples'), h('div', { class: 'chips' }, ...this.sampleChips));
+
+    if (this.features.network) {
+      const url = h('input', {
+        type: 'url',
+        id: 'model-url',
+        class: 'txt-in',
+        placeholder: 'https://…/model.glb',
+        spellcheck: 'false',
+        'aria-label': 'Model URL',
+      });
+      const load = h('button', { type: 'button', class: 'btn ghost', style: 'width:auto' }, 'Load');
+      const go = () => url.value.trim() && this.actions.loadUrl(url.value.trim());
+      load.addEventListener('click', go);
+      url.addEventListener('keydown', (e) => e.key === 'Enter' && go());
+      body.append(grp('From a link'), h('div', { class: 'btnrow', style: 'grid-template-columns:minmax(0,1fr) auto' }, url, load));
+    }
+
+    body.append(
+      this.statsEl,
+      this.animBlock,
+      tip(
+        'Drop a file anywhere on the page, or click the tile. A .gltf can come with its .bin and textures: select them together. Draco, Meshopt and KTX2 compression are supported.',
+        'Files never leave your computer. To show an uploaded model on another website, use Embed below.',
+      ),
+    );
+  }
+
+  private lookOptions(): FselOption[] {
+    const options: FselOption[] = PRESETS.map((preset) => {
+      const look = presetSettings(preset);
+      const ground = look.matchTheme ? THEME_GROUND[this.theme].bg : look.bg;
+      const ink = look.matchTheme
+        ? THEME_GROUND[this.theme].fg
+        : look.colorMode === 'gradient'
+          ? look.gradB
+          : look.colorMode === 'mono'
+            ? look.fg
+            : '#8edcf0';
+      return { value: preset.id, label: preset.name, group: PRESET_GROUPS[preset.group], swatch: { ground, ink } };
+    });
+    options.push({ value: 'custom', label: 'Custom', hidden: true });
+    return options;
+  }
+
+  private buildLook(body: HTMLElement): void {
+    this.lookFsel = new Fsel('look-select', 'Look', this.lookOptions());
+    this.lookFsel.onChange((v) => v !== 'custom' && this.actions.applyPreset(v));
+    const reset = button('Reset everything', { title: 'Restore every setting to its default' }, 'undo');
+    reset.addEventListener('click', () => this.actions.resetAll());
+    body.append(
+      h('div', { class: 'row2' }, h('label', { for: 'look-select-btn' }, 'Style'), this.lookFsel.el),
+      reset,
+      tip(
+        'Each look sets the glyphs, colours, shading and effects in one step; every control stays yours to change afterwards. Mono follows the light and dark switch above the render.',
+        'Keys 1 to 9 and 0 pick a look, X picks a random one.',
+      ),
+    );
+  }
+
+  private buildDownload(body: HTMLElement): void {
+    const name = h('input', { class: 'txt-in', id: 'export-name', value: this.fileName, maxlength: 40, spellcheck: 'false' });
+    name.addEventListener('input', () => (this.fileName = name.value.trim()));
+
+    const format = new Fsel('export-format', 'Format', FORMATS);
+    format.value = this.format;
+    format.onChange((v) => {
+      this.format = v as ExportFormat;
+      writePref('format', v);
+      this.syncExport();
+    });
+    const scale = new Fsel('export-scale', 'Scale', [
+      { value: '1', label: '1× the screen' },
+      { value: '2', label: '2× the screen' },
+      { value: '4', label: '4× the screen' },
+    ]);
+    scale.value = String(this.pngScale);
+    scale.onChange((v) => {
+      this.pngScale = Number(v) as PngScale;
+      writePref('pngScale', v);
+    });
+    const length = new Fsel('export-length', 'Length', [
+      { value: 'loop', label: 'One full turn' },
+      { value: '5', label: '5 seconds' },
+      { value: '10', label: '10 seconds' },
+    ]);
+    length.value = String(this.videoLength);
+    length.onChange((v) => {
+      this.videoLength = v === 'loop' ? 'loop' : (Number(v) as 5 | 10);
+      writePref('videoLength', v);
+    });
+
+    this.scaleField = h('div', { class: 'field' }, h('label', { for: 'export-scale-btn' }, 'Scale'), scale.el);
+    this.lengthField = h('div', { class: 'field' }, h('label', { for: 'export-length-btn' }, 'Length'), length.el);
+    const transparent = toggle(this.store, 'transparentBg', 'Transparent background');
+    this.controls.push(transparent);
+    this.transparentField = transparent.el;
+
+    this.exportBtn = h('button', { type: 'button', class: 'btn primary', id: 'btn-export' });
+    this.exportBtn.addEventListener('click', () => this.actions.runExport());
+    const copy = button('Copy ASCII text', { id: 'btn-copy-text' }, 'copy');
+    copy.addEventListener('click', () => this.actions.copyText());
+    const loadLook = button('Load a look file', { id: 'btn-load-look' }, 'file');
+    loadLook.addEventListener('click', () => this.actions.loadLook());
+
+    body.append(
+      h('div', { class: 'row2' }, h('label', { for: 'export-name' }, 'File name'), name),
+      h('div', { class: 'field' }, h('label', { for: 'export-format-btn' }, 'Format'), format.el),
+      this.scaleField,
+      this.lengthField,
+      this.transparentField,
+      h('div', { class: 'btns' }, this.exportBtn, copy, loadLook),
+      tip(
+        'Everything is saved from the frame between the panels. PNG goes up to 4× the screen; video records in real time, and One full turn loops seamlessly. SVG keeps every glyph as real, editable text for Figma or Illustrator.',
+      ),
+    );
+  }
+
+  private buildEmbed(body: HTMLElement): void {
+    const shape = new Fsel('embed-shape', 'Shape', SHAPES);
+    shape.value = this.embedShape;
+    shape.onChange((v) => {
+      this.embedShape = v as EmbedShape;
+      writePref('embedShape', v);
+    });
+    const orbitInput = h('input', { type: 'checkbox', id: 'embed-orbit' });
+    orbitInput.checked = this.embedOrbit;
+    orbitInput.addEventListener('change', () => {
+      this.embedOrbit = orbitInput.checked;
+      writePref('embedOrbit', orbitInput.checked ? 'on' : 'off');
+    });
+
+    // A model anyone can reach (a sample or a public link): one click.
+    const copyCode = h('button', { type: 'button', class: 'btn primary', id: 'btn-embed-code' }, svg('code'), h('span', {}, 'Copy embed code'));
+    copyCode.addEventListener('click', () => this.actions.copyEmbedCode());
+    const copyLink = button('Copy link to this look', { id: 'btn-share-link' }, 'link');
+    copyLink.addEventListener('click', () => this.actions.copyShareLink());
+    this.publicBlock = h(
+      'div',
+      { class: 'btns' },
+      h('p', { class: 'note' }, 'This model is already online, so the code works as it is: paste it into any page.'),
+      copyCode,
+      copyLink,
+    );
+
+    // A model that only exists on this computer: package it, host it, then paste its link.
+    const zip = h('button', { type: 'button', class: 'btn primary', id: 'btn-embed-zip', title: 'A folder for vercel.com/drop: index.html and model.glb' });
+    zip.addEventListener('click', () => this.actions.downloadEmbed('zip'));
+    const html = h('button', { type: 'button', class: 'btn ghost', id: 'btn-embed-html', title: 'One .html file with the model inside it' });
+    html.addEventListener('click', () => this.actions.downloadEmbed('html'));
+    this.embedButtons = { zip, html };
+    this.setEmbedBusy(null);
+    this.hostedInput = h('input', {
+      type: 'url',
+      class: 'txt-in',
+      id: 'embed-url',
+      placeholder: 'https://your-embed.vercel.app',
+      spellcheck: 'false',
+      'aria-label': 'Link to the hosted embed',
+    });
+    const copyHosted = h('button', { type: 'button', class: 'btn primary', id: 'btn-embed-hosted' }, svg('code'), h('span', {}, 'Copy embed code'));
+    copyHosted.addEventListener('click', () => this.actions.copyHostedEmbed(this.hostedInput.value.trim()));
+    this.hostedInput.addEventListener('keydown', (e) => e.key === 'Enter' && copyHosted.click());
+    this.privateBlock = h(
+      'ol',
+      { class: 'steps' },
+      h(
+        'li',
+        {},
+        h(
+          'div',
+          {},
+          h('span', {}, h('b', {}, 'Download the embed. '), 'Your model and this look, ready to host: a .zip for Vercel, or one .html file.'),
+          h('div', { class: 'btnrow' }, zip, html),
+        ),
+      ),
+      h(
+        'li',
+        {},
+        h(
+          'div',
+          {},
+          h(
+            'span',
+            {},
+            h('b', {}, 'Put it online. '),
+            'Drag the .zip onto ',
+            h('a', { href: 'https://vercel.com/drop', target: '_blank', rel: 'noopener' }, 'vercel.com/drop'),
+            ', or upload the .html to any web host.',
+          ),
+        ),
+      ),
+      h(
+        'li',
+        {},
+        h('div', {}, h('span', {}, h('b', {}, 'Paste its link here. '), 'You get the code to put on your site.'), this.hostedInput, copyHosted),
+      ),
+    );
+
+    this.codeBox = h('pre', { class: 'codebox', id: 'embed-code', hidden: true });
+
+    body.append(
+      h('div', { class: 'row2' }, h('label', { for: 'embed-shape-btn' }, 'Shape'), shape.el),
+      h('label', { class: 'chk' }, orbitInput, 'Drag to orbit'),
+      this.publicBlock,
+      this.privateBlock,
+      this.codeBox,
+      tip(
+        'An embed is a page that shows the render full-bleed and nothing else, placed on your site with an <iframe>.',
+        'An uploaded model only exists on your computer, so it has to be put online before another site can show it. The embed download carries the renderer, the model and the look and needs nothing else, so it works on any host and keeps working even if this tool moves.',
+      ),
+    );
+  }
+
+  private credit(): HTMLElement {
+    const tour = h('button', { type: 'button', class: 'credit-tour', id: 'btn-tour' }, 'Take the tour again');
+    tour.addEventListener('click', () => this.actions.startTour());
+    const keys: [string, string][] = [
+      ['Space', 'Pause or play motion'],
+      ['X', 'Random look'],
+      ['1–0', 'Pick a look'],
+      ['S', 'Save a PNG'],
+      ['R', 'Reset the view'],
+      ['H', 'Hide the panels'],
+      ['F', 'Full screen'],
+      ['U', 'Upload a model'],
+    ];
+    const shortcuts = h(
+      'details',
+      { class: 'tip', style: 'margin-top:10px' },
+      h('summary', {}, 'Keyboard shortcuts'),
+      h('dl', { class: 'keys' }, ...keys.flatMap(([k, v]) => [h('dt', {}, h('kbd', {}, k)), h('dd', {}, v)])),
+    );
+    return h(
+      'div',
+      { class: 'credit fp' },
+      h('b', {}, 'ASCII 3D'),
+      'Designed & built by ',
+      h('span', {}, '@btrxinfinity'),
+      h(
+        'em',
+        {},
+        'Fox sample: PixelMannen (CC0); rigging and animation by tomkranis, glTF by AsoboStudio and scurest (CC BY 4.0), from the ',
+        h('a', { href: 'https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/Fox', target: '_blank', rel: 'noopener' }, 'Khronos samples'),
+        '. Rendering by three.js. Interface icons by Iconoir, MIT.',
+      ),
+      shortcuts,
+      tour,
+    );
+  }
+
+  // ─── Right rail: how it looks ────────────────────────────
+
+  private rightSections(): SectionDef[] {
     const { store } = this;
     return [
       {
-        id: 'presets',
-        title: 'Looks',
-        summary: () => this.activePresetName() ?? 'Custom',
-        build: (body) => {
-          this.presetButtons = PRESETS.map((preset, i) => {
-            const look = presetSettings(preset);
-            const glyphColor = look.colorMode === 'mono' ? look.fg : look.colorMode === 'gradient' ? look.gradC : '#ffffff';
-            const swatch = h(
-              'span',
-              { class: 'preset-swatch', 'aria-hidden': 'true' },
-              h('span', { style: `background:${look.bg};color:${glyphColor}` }, rampFor(look).slice(1, 5).join('')),
-              h('span', { style: `background:${look.colorMode === 'gradient' ? look.gradB : glyphColor}` }),
-              h('span', { style: `background:${look.accent}` }),
-            );
-            const btn = h(
-              'button',
-              { type: 'button', class: 'preset', 'aria-pressed': 'false', title: `${preset.hint} (${i + 1})` },
-              swatch,
-              h('span', { class: 'preset-name' }, preset.name),
-            );
-            btn.addEventListener('click', () => this.actions.applyPreset(preset.id));
-            return btn;
-          });
-          const randomize = button('Randomize', { title: 'Random look (X)' }, 'dice');
-          randomize.addEventListener('click', () => this.actions.randomize());
-          const reset = button('Reset all', { title: 'Restore every setting to its default' }, 'undo');
-          reset.addEventListener('click', () => this.actions.resetAll());
-          body.append(h('div', { class: 'presets' }, ...this.presetButtons), h('div', { class: 'button-row' }, randomize, reset));
-        },
-      },
-      {
-        id: 'model',
-        title: 'Model',
-        summary: () => (this.model ? `${this.model.name} · ${formatCount(this.model.triangles)} tris` : 'None'),
-        build: (body) => {
-          const upload = button('Upload model', { class: 'btn btn-primary btn-block' }, 'upload');
-          upload.addEventListener('click', () => this.actions.openFilePicker());
-          this.sampleButtons = SAMPLES.map((sample) => {
-            const btn = h('button', { type: 'button', class: 'sample', title: sample.hint, 'aria-pressed': 'false', 'data-id': sample.id }, sample.label);
-            btn.addEventListener('click', () => this.actions.loadSample(sample.id));
-            return btn;
-          });
-          body.append(
-            upload,
-            h('p', { class: 'help' }, 'Or drop a .glb, .gltf, .fbx, .obj or .stl file anywhere. Files stay on your device.'),
-            h('p', { class: 'subhead' }, 'Samples'),
-            h('div', { class: 'samples' }, ...this.sampleButtons),
-          );
-
-          if (this.features.urlLoading) {
-            const url = h('input', {
-              type: 'url',
-              id: 'model-url',
-              class: 'text-input',
-              placeholder: 'https://example.com/model.glb',
-              'aria-label': 'Model URL',
-              spellcheck: 'false',
-            });
-            const load = button('Load', {}, 'download');
-            const go = () => url.value.trim() && this.actions.loadUrl(url.value.trim());
-            load.addEventListener('click', go);
-            url.addEventListener('keydown', (e) => e.key === 'Enter' && go());
-            body.append(h('p', { class: 'subhead' }, 'From a URL'), h('div', { class: 'url-row' }, url, load));
-          }
-
-          this.statsEl = h('dl', { class: 'stats' });
-          body.append(this.statsEl);
-
-          this.add(
-            body,
-            segmented(store, 'shading', 'Shading', entries<Shading>(SHADINGS), {
-              grid: true,
-              hint: 'How the model is lit before it becomes glyphs.',
-            }),
-            color(store, 'baseColor', 'Surface color', {
-              when: (s) => s.shading === 'clay' || s.shading === 'toon' || s.shading === 'wireframe',
-            }),
-            toggle(store, 'flatShading', 'Faceted', {
-              hint: 'Flat shading per triangle.',
-              when: (s) => s.shading === 'clay' || s.shading === 'normal',
-            }),
-          );
-
-          this.clipSelect = h('select', { id: 'clip-select', 'aria-label': 'Animation clip' });
-          this.clipSelect.addEventListener('change', () => this.actions.playClip(Number(this.clipSelect.value)));
-          this.motionButton = button('Pause', { title: 'Pause or play all motion (Space)' }, 'pause');
-          this.motionButton.addEventListener('click', () => this.actions.toggleMotion());
-          const speed = slider(store, 'animSpeed', 'Animation speed', { unit: '×' });
-          this.controls.push(speed);
-          this.animBlock = h(
-            'div',
-            { class: 'section-body', style: 'padding:0' },
-            h('p', { class: 'subhead' }, 'Animation'),
-            h('div', { class: 'anim-row' }, this.clipSelect, this.motionButton),
-            speed.el,
-          );
-          this.animBlock.hidden = true;
-          body.append(this.animBlock);
-        },
-      },
-      {
         id: 'glyphs',
+        icon: 'type',
         title: 'Glyphs',
-        summary: (s) => `${CHARSETS[s.charset].label.replace('…', '')} · ${s.cellSize}px`,
+        sub: 'Characters, cell size and font',
+        open: true,
         build: (body) => {
-          const preview = h('pre', { class: 'ramp-preview', 'aria-label': 'Character ramp, light to dense' });
+          const ramp = h('pre', { class: 'ramp', 'aria-label': 'Character ramp, light to dense' });
           this.add(
             body,
-            select(store, 'charset', 'Character set', (Object.keys(CHARSETS) as CharsetId[]).map((id) => [id, CHARSETS[id].label])),
-            text(store, 'customChars', 'Custom characters', {
+            selectRow(
+              store,
+              'charset',
+              'Set',
+              (Object.keys(CHARSETS) as CharsetId[]).map((id) => ({ value: id, label: CHARSETS[id].label })),
+            ),
+            textField(store, 'customChars', 'Your characters, light to dense', {
               placeholder: ' .:-=+*#%@',
-              hint: 'Order from lightest to densest. Start with a space so dark areas stay empty.',
               when: (s) => s.charset === 'custom',
             }),
-            custom(preview, (s) => {
-              const ramp = rampFor(s).map((c) => (c === ' ' ? '·' : c)).join('');
-              if (preview.textContent !== ramp) preview.textContent = ramp;
-              preview.style.fontFamily = FONTS[s.font].family ? `"${FONTS[s.font].family}", monospace` : 'monospace';
+            custom(ramp, (s) => {
+              const text = rampFor(s).map((c) => (c === ' ' ? '·' : c)).join('');
+              if (ramp.textContent !== text) ramp.textContent = text;
+              const family = FONTS[s.font].family;
+              ramp.style.fontFamily = family ? `"${family}", var(--mono)` : 'var(--mono)';
             }),
-            slider(store, 'cellSize', 'Cell size', { unit: 'px', hint: 'Height of one character cell.' }),
-            slider(store, 'charAspect', 'Character width', { hint: 'Cell width as a fraction of its height.' }),
-            slider(store, 'glyphScale', 'Glyph scale', { scale: 100, unit: '%', hint: 'Size of each glyph inside its cell.' }),
-            select(store, 'font', 'Font', (Object.keys(FONTS) as FontId[]).map((id) => [id, FONTS[id].label])),
+            scrub(store, 'cellSize', 'Cell size', { unit: ' px' }),
+            scrub(store, 'charAspect', 'Character width'),
+            scrub(store, 'glyphScale', 'Glyph scale', { scale: 100, unit: '%' }),
+            selectRow(
+              store,
+              'font',
+              'Font',
+              (Object.keys(FONTS) as FontId[]).map((id) => ({ value: id, label: FONTS[id].label })),
+            ),
             toggle(store, 'bold', 'Bold'),
+            tip(
+              'Every cell of the render becomes one character, picked from the set by how bright the cell is: the first character is the lightest, the last the densest. Smaller cells show more detail.',
+            ),
           );
         },
       },
       {
         id: 'tone',
+        icon: 'contrast',
         title: 'Tone',
-        summary: (s) =>
-          [`C ${s.contrast.toFixed(2)}`, `γ ${s.gamma.toFixed(2)}`, s.invert && 'inverted', s.edges && 'edges']
-            .filter(Boolean)
-            .join(' · '),
+        sub: 'How brightness becomes density',
+        open: false,
         build: (body) => {
           this.add(
             body,
-            slider(store, 'exposure', 'Exposure', { hint: 'Scene brightness before glyph mapping.' }),
-            slider(store, 'brightness', 'Brightness'),
-            slider(store, 'contrast', 'Contrast'),
-            slider(store, 'gamma', 'Gamma', { hint: 'Above 1 opens up the midtones.' }),
-            slider(store, 'threshold', 'Cutoff', { hint: 'Cells darker than this stay empty.' }),
-            slider(store, 'dither', 'Dither', { hint: 'Ordered dithering between neighboring glyph levels.' }),
-            toggle(store, 'invert', 'Invert', { hint: 'Dense glyphs for dark areas. Use with light backgrounds.' }),
-            toggle(store, 'fillSilhouette', 'Fill silhouette', { hint: 'Never leave a covered cell blank.' }),
-            toggle(store, 'edges', 'Edge lines', { hint: 'Outline shapes with | / - \\ glyphs.' }),
-            slider(store, 'edgeThreshold', 'Edge sensitivity', {
-              hint: 'Lower values find more edges.',
-              when: (s) => s.edges,
-            }),
+            scrub(store, 'exposure', 'Exposure'),
+            scrub(store, 'brightness', 'Brightness'),
+            scrub(store, 'contrast', 'Contrast'),
+            scrub(store, 'gamma', 'Gamma'),
+            scrub(store, 'threshold', 'Cutoff'),
+            scrub(store, 'dither', 'Dither'),
+            toggle(store, 'invert', 'Invert'),
+            toggle(store, 'fillSilhouette', 'Fill the silhouette'),
+            toggle(store, 'edges', 'Edge lines'),
+            scrub(store, 'edgeThreshold', 'Edge sensitivity', { when: (s) => s.edges }),
+            tip(
+              'Contrast and gamma shape which character each cell gets; cells darker than the cutoff stay empty. Invert prints dense glyphs where the model is dark. Edge lines outline shapes with | / - \\.',
+            ),
           );
         },
       },
       {
         id: 'color',
-        title: 'Color',
-        summary: (s) => `${COLOR_MODES[s.colorMode]} · ${s.transparentBg ? 'transparent' : s.bg}`,
+        icon: 'droplet',
+        title: 'Colour',
+        sub: 'Glyphs, ground and accent',
+        open: false,
         build: (body) => {
-          const gradient = h('div', { class: 'gradient-preview', 'aria-hidden': 'true' });
+          const bar = h('div', { class: 'gradbar', 'aria-hidden': 'true' });
+          const own = (s: Readonly<Settings>) => !s.matchTheme;
           this.add(
             body,
-            segmented(store, 'colorMode', 'Glyph color', entries<ColorMode>(COLOR_MODES), {
-              hint: 'Model: colors from the render. Solid: one color. Gradient: dark → mid → light by brightness.',
-            }),
-            color(store, 'fg', 'Glyphs', { when: (s) => s.colorMode === 'mono' }),
-            color(store, 'gradA', 'Shadows', { when: (s) => s.colorMode === 'gradient' }),
-            color(store, 'gradB', 'Midtones', { when: (s) => s.colorMode === 'gradient' }),
-            color(store, 'gradC', 'Highlights', { when: (s) => s.colorMode === 'gradient' }),
+            toggle(store, 'matchTheme', 'Match the interface theme'),
+            selectRow(store, 'colorMode', 'Glyphs', entries(COLOR_MODES), { when: own }),
+            colorRow(store, 'fg', 'Glyph', { when: (s) => own(s) && s.colorMode === 'mono' }),
+            colorRow(store, 'gradA', 'Shadows', { when: (s) => own(s) && s.colorMode === 'gradient' }),
+            colorRow(store, 'gradB', 'Midtones', { when: (s) => own(s) && s.colorMode === 'gradient' }),
+            colorRow(store, 'gradC', 'Highlights', { when: (s) => own(s) && s.colorMode === 'gradient' }),
             custom(
-              gradient,
-              (s) => (gradient.style.background = `linear-gradient(to right, ${s.gradA}, ${s.gradB}, ${s.gradC})`),
-              (s) => s.colorMode === 'gradient',
+              bar,
+              (s) => (bar.style.background = `linear-gradient(to right, ${s.gradA}, ${s.gradB}, ${s.gradC})`),
+              (s) => own(s) && s.colorMode === 'gradient',
             ),
-            slider(store, 'colorBoost', 'Color boost', {
-              hint: 'Lifts dark colors toward full brightness.',
-              when: (s) => s.colorMode === 'original',
-            }),
-            slider(store, 'saturation', 'Saturation', { when: (s) => s.colorMode === 'original' }),
-            color(store, 'bg', 'Background', { when: (s) => !s.transparentBg }),
-            toggle(store, 'transparentBg', 'Transparent background', { hint: 'For PNG cut-outs and overlays.' }),
-            color(store, 'accent', 'Accent', { hint: 'Scan beam, cursor lens, field and grid.' }),
+            scrub(store, 'colorBoost', 'Colour boost', { when: (s) => own(s) && s.colorMode === 'original' }),
+            scrub(store, 'saturation', 'Saturation', { when: (s) => own(s) && s.colorMode === 'original' }),
+            colorRow(store, 'bg', 'Ground', { when: (s) => own(s) && !s.transparentBg }),
+            colorRow(store, 'accent', 'Accent', { when: own }),
+            toggle(store, 'transparentBg', 'Transparent background'),
+            tip(
+              'Matching the theme prints ink on white in light mode and white on black in dark mode. Otherwise glyphs take the model’s own colours, one colour, or a gradient from shadows to highlights. The accent colours the scan beam, the cursor lens and the background field.',
+            ),
           );
         },
       },
       {
         id: 'light',
+        icon: 'sun',
         title: 'Light',
-        summary: (s) => `${s.lightAzimuth}° · ${s.lightElevation}°`,
+        sub: 'Shading and lighting',
+        open: false,
         build: (body) => {
           this.add(
             body,
-            slider(store, 'lightAzimuth', 'Key direction', { unit: '°', hint: 'Left (−) to right (+), relative to the view.' }),
-            slider(store, 'lightElevation', 'Key height', { unit: '°' }),
-            slider(store, 'lightIntensity', 'Key strength'),
-            slider(store, 'rim', 'Rim light', { hint: 'Back light that outlines the silhouette.' }),
-            slider(store, 'ambient', 'Ambient'),
-            slider(store, 'envIntensity', 'Reflections', { hint: 'Soft studio environment for glossy materials.' }),
+            selectRow(store, 'shading', 'Shading', entries(SHADINGS)),
+            colorRow(store, 'baseColor', 'Surface', {
+              when: (s) => s.shading === 'clay' || s.shading === 'toon' || s.shading === 'wireframe',
+            }),
+            toggle(store, 'flatShading', 'Faceted', { when: (s) => s.shading === 'clay' || s.shading === 'normal' }),
+            grp('Key light'),
+            scrub(store, 'lightAzimuth', 'Direction', { unit: '°' }),
+            scrub(store, 'lightElevation', 'Height', { unit: '°' }),
+            scrub(store, 'lightIntensity', 'Strength'),
+            grp('Fill'),
+            scrub(store, 'rim', 'Rim light'),
+            scrub(store, 'ambient', 'Ambient'),
+            scrub(store, 'envIntensity', 'Reflections'),
+            tip(
+              'The key light sits relative to the view, so the shading reads the same from any angle. Original keeps the model’s materials; Clay, Toon, Normals, Depth and Wire replace them for a cleaner read.',
+            ),
           );
         },
       },
       {
         id: 'motion',
+        icon: 'orbit',
         title: 'Motion',
-        summary: (s) => `${s.spin === 0 ? 'still' : `${s.spin}°/s`} · ${FRAMES[s.frame].split(' ')[0]}`,
+        sub: 'Spin, float and framing',
+        open: false,
         build: (body) => {
-          const reset = button('Reset view', { title: 'Reset camera (R)' }, 'target');
+          const reset = button('Reset the view', { title: 'Reset camera (R)' }, 'target');
           reset.addEventListener('click', () => this.actions.resetView());
           this.add(
             body,
-            slider(store, 'spin', 'Turntable', { unit: '°/s', hint: 'Negative values spin the other way.' }),
-            slider(store, 'float', 'Float', { hint: 'Gentle bobbing.' }),
-            slider(store, 'follow', 'Follow cursor', { hint: 'The model turns toward the pointer.' }),
-            slider(store, 'fov', 'Field of view', { unit: '°' }),
-            select(store, 'frame', 'Frame', entries<FrameId>(FRAMES), { hint: 'Aspect ratio for the view and exports.' }),
+            scrub(store, 'spin', 'Turntable', { unit: '°/s' }),
+            scrub(store, 'float', 'Float'),
+            scrub(store, 'follow', 'Follow the cursor'),
+            scrub(store, 'fov', 'Field of view', { unit: '°' }),
+            selectRow(store, 'frame', 'Frame', entries(FRAMES)),
+            reset,
+            tip(
+              'Drag the render to orbit and scroll to zoom. Frame fixes the shape that downloads capture; Fill uses the whole space between the panels.',
+            ),
           );
-          body.append(reset);
         },
       },
       {
         id: 'effects',
+        icon: 'sparkles',
         title: 'Effects',
-        summary: (s) =>
-          [s.scan && 'scan', s.lens && 'lens', s.glow > 0 && 'glow', s.noise > 0 && 'noise', s.crt > 0 && 'crt']
-            .filter(Boolean)
-            .join(' · ') || 'none',
+        sub: 'Scan beam, glow and texture',
+        open: false,
         build: (body) => {
           this.add(
             body,
-            toggle(store, 'scan', 'Scan beam', { hint: 'A sweeping sensor line that scrambles and tints glyphs.' }),
-            select(store, 'scanDirection', 'Direction', entries<ScanDirection>(SCAN_DIRECTIONS), { when: (s) => s.scan }),
-            slider(store, 'scanSpeed', 'Sweeps per second', { when: (s) => s.scan }),
-            slider(store, 'scanWidth', 'Trail length', { when: (s) => s.scan }),
-            slider(store, 'scanGlitch', 'Scramble', { when: (s) => s.scan }),
-            toggle(store, 'lens', 'Cursor lens', { hint: 'Glyphs near the pointer decode and light up.' }),
-            slider(store, 'lensRadius', 'Lens size', { unit: 'px', when: (s) => s.lens }),
-            slider(store, 'glow', 'Glow'),
-            slider(store, 'glowRadius', 'Glow spread', { when: (s) => s.glow > 0 }),
-            slider(store, 'glowThreshold', 'Glow threshold', { when: (s) => s.glow > 0 }),
-            slider(store, 'noise', 'Flicker', { hint: 'Random glyph swaps.' }),
-            slider(store, 'field', 'Background field', { hint: 'Sparse glyphs in the empty space.' }),
-            slider(store, 'grid', 'Cell grid'),
-            slider(store, 'crt', 'CRT lines'),
-            slider(store, 'vignette', 'Vignette'),
-            toggle(store, 'reveal', 'Decode on load', { hint: 'New models resolve through scrambled glyphs.' }),
-          );
-        },
-      },
-      {
-        id: 'export',
-        title: 'Export',
-        summary: () => 'PNG · video · text · SVG',
-        build: (body) => this.buildExport(body),
-      },
-      {
-        id: 'help',
-        title: 'Shortcuts & credits',
-        summary: () => '',
-        build: (body) => {
-          const keys: [string, string][] = [
-            ['U', 'Upload a model'],
-            ['S', 'Save PNG'],
-            ['Space', 'Pause or play motion'],
-            ['R', 'Reset view'],
-            ['H', 'Hide or show the interface'],
-            ['F', 'Full screen'],
-            ['X', 'Random look'],
-            ['1–9', 'Apply a look'],
-          ];
-          body.append(
-            h('dl', { class: 'keys' }, ...keys.flatMap(([k, v]) => [h('dt', {}, h('kbd', {}, k)), h('dd', { style: 'margin:0' }, v)])),
-            h('p', { class: 'help' }, 'Double-click any slider label to reset it.'),
-            h(
-              'p',
-              { class: 'credits' },
-              'Fox sample: model by PixelMannen (CC0); rigging and animation by tomkranis (CC BY 4.0); glTF conversion by AsoboStudio and scurest (CC BY 4.0), via the ',
-              h('a', { href: 'https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/Fox', target: '_blank', rel: 'noopener' }, 'Khronos glTF sample assets'),
-              '. Rendering by ',
-              h('a', { href: 'https://threejs.org', target: '_blank', rel: 'noopener' }, 'three.js'),
-              '.',
+            toggle(store, 'scan', 'Scan beam'),
+            selectRow(store, 'scanDirection', 'Direction', entries(SCAN_DIRECTIONS), { when: (s) => s.scan }),
+            scrub(store, 'scanSpeed', 'Sweeps per second', { when: (s) => s.scan }),
+            scrub(store, 'scanWidth', 'Trail', { when: (s) => s.scan }),
+            scrub(store, 'scanGlitch', 'Scramble', { when: (s) => s.scan }),
+            toggle(store, 'lens', 'Cursor lens'),
+            scrub(store, 'lensRadius', 'Lens size', { unit: ' px', when: (s) => s.lens }),
+            grp('Glow'),
+            scrub(store, 'glow', 'Glow'),
+            scrub(store, 'glowRadius', 'Spread', { when: (s) => s.glow > 0 }),
+            scrub(store, 'glowThreshold', 'Threshold', { when: (s) => s.glow > 0 }),
+            grp('Texture'),
+            scrub(store, 'noise', 'Flicker'),
+            scrub(store, 'field', 'Background field'),
+            scrub(store, 'grid', 'Cell grid'),
+            scrub(store, 'crt', 'CRT lines'),
+            scrub(store, 'vignette', 'Vignette'),
+            toggle(store, 'reveal', 'Decode on load'),
+            tip(
+              'The scan beam sweeps the frame, scrambling and tinting glyphs as it passes. The cursor lens decodes glyphs under the pointer. Glow works best on dark grounds.',
             ),
           );
         },
@@ -433,114 +724,15 @@ export class Panel {
     ];
   }
 
-  private buildExport(body: HTMLElement): void {
-    const pngScale = this.localChoice<PngScale>(
-      'png-scale',
-      'Resolution',
-      [
-        [1, '1×'],
-        [2, '2×'],
-        [4, '4×'],
-      ],
-      () => this.pngScale,
-      (v) => {
-        this.pngScale = v;
-        writePref('pngScale', String(v));
-      },
-    );
-    const savePng = button('Save PNG', { class: 'btn btn-block' }, 'camera');
-    savePng.addEventListener('click', () => this.actions.savePng());
+  // ─── Updates ─────────────────────────────────────────────
 
-    const videoLength = this.localChoice<VideoLength>(
-      'video-length',
-      'Length',
-      [
-        ['loop', 'One loop'],
-        [5, '5 s'],
-        [10, '10 s'],
-      ],
-      () => this.videoLength,
-      (v) => {
-        this.videoLength = v;
-        writePref('videoLength', String(v));
-      },
-    );
-    this.recordButton = button('Record video', { class: 'btn btn-block' }, 'record');
-    this.recordButton.addEventListener('click', () => this.actions.toggleRecording());
-
-    const copyText = button('Copy', { title: 'Copy the frame as plain text' }, 'copy');
-    copyText.addEventListener('click', () => this.actions.copyText());
-    const saveTxt = button('.txt', { title: 'Save the frame as a text file' }, 'download');
-    saveTxt.addEventListener('click', () => this.actions.saveText());
-    const saveSvg = button('.svg', { title: 'Save the frame as vector SVG (editable in Figma or Illustrator)' }, 'download');
-    saveSvg.addEventListener('click', () => this.actions.saveSvg());
-
-    const saveLook = button('Save look', { title: 'Save these settings as a .json file' }, 'download');
-    saveLook.addEventListener('click', () => this.actions.saveLook());
-    const loadLook = button('Load look', { title: 'Load settings from a .json file' }, 'file');
-    loadLook.addEventListener('click', () => this.actions.loadLook());
-
-    body.append(
-      h('p', { class: 'subhead' }, 'Image'),
-      pngScale,
-      savePng,
-      h('p', { class: 'help' }, 'Turn on Transparent background under Color for a cut-out.'),
-      h('p', { class: 'subhead' }, 'Video'),
-      videoLength,
-      this.recordButton,
-      h('p', { class: 'help' }, 'One loop records a full turn of the turntable, so the clip repeats seamlessly.'),
-      h('p', { class: 'subhead' }, 'Text & vector'),
-      h('div', { class: 'button-row' }, copyText, saveTxt, saveSvg),
-      h('p', { class: 'subhead' }, 'Look'),
-      h('div', { class: 'button-row' }, saveLook, loadLook),
-    );
-
-    if (this.features.sharing) {
-      const link = button('Copy link', { title: 'A link that opens this look' }, 'link');
-      link.addEventListener('click', () => this.actions.copyShareLink());
-      const embed = button('Embed code', { title: 'An <iframe> snippet for your website' }, 'code');
-      embed.addEventListener('click', () => this.actions.copyEmbedCode());
-      body.append(
-        h('p', { class: 'subhead' }, 'Share'),
-        h('div', { class: 'button-row' }, link, embed),
-        h('p', { class: 'help' }, 'Links carry the settings and the sample or URL model. Uploaded files stay on your device.'),
-      );
-    }
-  }
-
-  /** A segmented control for panel-only preferences (not part of the saved look). */
-  private localChoice<T extends string | number>(
-    id: string,
-    label: string,
-    options: [T, string][],
-    get: () => T,
-    set: (value: T) => void,
-  ): HTMLElement {
-    const buttons = options.map(([value, text]) =>
-      h('button', { type: 'button', role: 'radio', 'aria-checked': String(get() === value) }, text),
-    );
-    const refresh = () => buttons.forEach((b, i) => b.setAttribute('aria-checked', String(options[i][0] === get())));
-    buttons.forEach((b, i) =>
-      b.addEventListener('click', () => {
-        set(options[i][0]);
-        refresh();
-      }),
-    );
-    return h(
-      'div',
-      { class: 'field' },
-      h('span', { class: 'label' }, label),
-      h('div', { class: 'segmented', role: 'radiogroup', id: `ctl-${id}`, 'aria-label': label }, ...buttons),
-    );
-  }
-
-  private activePresetName(): string | null {
+  private activePreset(): string {
     const s = this.store.value;
-    const active = PRESETS.find((preset) => {
+    const match = PRESETS.find((preset) => {
       const look = presetSettings(preset);
       return SETTING_KEYS.every((key) => PRESET_IGNORED.includes(key) || look[key] === s[key]);
     });
-    return active?.name ?? null;
+    return match?.id ?? 'custom';
   }
 
   private sync(s: Readonly<Settings>): void {
@@ -548,45 +740,80 @@ export class Panel {
       if (control.when) control.el.hidden = !control.when(s);
       control.sync(s);
     }
-    for (const { el, fn } of this.summaries) {
-      const value = fn(s);
-      if (el.textContent !== value) el.textContent = value;
-    }
-    const activeName = this.activePresetName();
-    this.presetButtons.forEach((btn, i) => btn.setAttribute('aria-pressed', String(PRESETS[i].name === activeName)));
+    this.lookFsel.value = this.activePreset();
   }
 
-  setModel(info: ModelInfo | null, activeClip: number): void {
-    this.model = info;
+  private syncExport(): void {
+    const labels: Record<ExportFormat, string> = {
+      png: 'Export PNG',
+      video: 'Start recording',
+      svg: 'Export SVG',
+      txt: 'Export text',
+      json: 'Save the look',
+    };
+    this.exportBtn.replaceChildren(svg(this.format === 'video' ? 'video' : 'export'), h('span', {}, labels[this.format]));
+    this.scaleField.hidden = this.format !== 'png';
+    this.lengthField.hidden = this.format !== 'video';
+    this.transparentField.hidden = this.format !== 'png' && this.format !== 'svg';
+  }
+
+  setTheme(theme: UiTheme): void {
+    this.theme = theme;
+    this.lookFsel.setOptions(this.lookOptions());
+    this.lookFsel.value = this.activePreset();
+  }
+
+  setModel(info: ModelInfo | null, activeClip: number, publicModel: boolean): void {
+    this.publicModel = publicModel && this.features.network;
     const source = info?.source;
-    this.sampleButtons.forEach((btn) =>
-      btn.setAttribute('aria-pressed', String(source?.kind === 'sample' && source.id === btn.dataset.id)),
+    this.modelName.textContent = info ? info.name : 'GLB, glTF, FBX, OBJ or STL';
+    this.sampleChips.forEach((chip) =>
+      chip.setAttribute('aria-pressed', String(source?.kind === 'sample' && source.id === chip.dataset.id)),
     );
-
-    this.statsEl.replaceChildren(
-      ...[
-        ['Meshes', info ? formatCount(info.meshes) : '–'],
-        ['Triangles', info ? formatCount(info.triangles) : '–'],
-        ['Clips', info ? String(info.clips.length) : '–'],
-      ].map(([k, v]) => h('div', {}, h('dt', {}, k), h('dd', {}, v))),
-    );
-
+    this.statsEl.textContent = info
+      ? [
+          `${formatCount(info.triangles)} triangles`,
+          `${info.meshes} mesh${info.meshes === 1 ? '' : 'es'}`,
+          info.clips.length ? `${info.clips.length} clip${info.clips.length === 1 ? '' : 's'}` : 'no animation',
+        ].join(' · ')
+      : '';
     const clips = info?.clips ?? [];
     this.animBlock.hidden = clips.length === 0;
-    this.clipSelect.replaceChildren(...clips.map((name, i) => h('option', { value: i }, name)));
-    if (clips.length) this.clipSelect.value = String(Math.max(0, activeClip));
-    this.sync(this.store.value);
+    this.clipFsel.setOptions(clips.map((name, i) => ({ value: String(i), label: name })));
+    if (clips.length) this.clipFsel.value = String(Math.max(0, activeClip));
+    if (!this.fileName || this.fileName === 'ascii3d' || this.fileName.startsWith('ascii3d-')) {
+      this.fileName = info ? `ascii3d-${info.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}` : 'ascii3d';
+      const input = document.getElementById('export-name') as HTMLInputElement | null;
+      if (input) input.value = this.fileName;
+    }
+    this.publicBlock.hidden = !this.publicModel;
+    this.privateBlock.hidden = this.publicModel;
+    this.codeBox.hidden = true;
+  }
+
+  /** While an embed is being packed, its button says so and neither can be pressed twice. */
+  setEmbedBusy(kind: 'zip' | 'html' | null): void {
+    for (const key of ['zip', 'html'] as const) {
+      const btn = this.embedButtons[key];
+      btn.disabled = kind !== null;
+      btn.replaceChildren(svg('export'), h('span', {}, kind === key ? 'Packing…' : `.${key}`));
+    }
+  }
+
+  showEmbedCode(code: string): void {
+    this.codeBox.textContent = code;
+    this.codeBox.hidden = false;
   }
 
   setMotionPaused(paused: boolean): void {
-    this.motionButton.replaceChildren(icon(paused ? 'play' : 'pause'), h('span', {}, paused ? 'Play' : 'Pause'));
+    this.motionBtn.replaceChildren(svg(paused ? 'play' : 'pause'), h('span', {}, paused ? 'Play motion' : 'Pause motion'));
   }
 
   setRecording(recording: boolean, label?: string): void {
-    this.recordButton.replaceChildren(
-      icon(recording ? 'stop' : 'record'),
-      h('span', {}, recording ? label ?? 'Stop recording' : 'Record video'),
+    if (this.format !== 'video') return;
+    this.exportBtn.replaceChildren(
+      svg(recording ? 'stop' : 'video'),
+      h('span', {}, recording ? (label ?? 'Stop recording') : 'Start recording'),
     );
-    this.recordButton.classList.toggle('btn-primary', recording);
   }
 }

@@ -64,9 +64,20 @@ describe('defaults and presets', () => {
     }
   });
 
-  it('preset ids are unique and fit the 1–9 shortcuts', () => {
+  it('preset ids are unique and fit the 1–9 and 0 shortcuts', () => {
     expect(new Set(PRESETS.map((p) => p.id)).size).toBe(PRESETS.length);
-    expect(PRESETS.length).toBeLessThanOrEqual(9);
+    expect(PRESETS.length).toBeLessThanOrEqual(10);
+  });
+
+  it('Mono is the default look and the first preset', () => {
+    expect(PRESETS[0].id).toBe('mono');
+    expect(presetSettings(PRESETS[0])).toEqual(defaultSettings());
+  });
+
+  it('randomLook sets its own ground rather than following the theme', () => {
+    const look = randomLook(defaultSettings());
+    expect(look.matchTheme).toBe(false);
+    expect(look.invert).toBe(false);
   });
 
   it('randomLook always produces valid settings and keeps motion', () => {
